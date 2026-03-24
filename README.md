@@ -6,7 +6,7 @@
 
 PortManager is a container port terminal management environment where agents schedule cranes, berths, yard storage, and truck/rail departures over a 168-hour (1-week) planning horizon. The simulation models a medium-large port with realistic vessel arrivals, STS crane operations, yard management, gate/rail logistics, and disruption events (storms, labor strikes, customs delays, equipment breakdowns).
 
-Note: this is a synthetic environment which is majority AI-generated; it is recommended to test before use in any RL pipeline.
+Note: this is a synthetic environment that should be tested thoroughly before use in an RL pipeline.
 
 ## Capabilities
 
@@ -47,17 +47,7 @@ Each task simulates a 168-hour (1-week) planning horizon with 6-14 vessel arriva
 
 ## Reward Structure
 
-This is a dense, verifiable reward environment. Rewards are computed on each `advance_time` call as a weighted combination of 7 components (all normalized to [0, 1]):
-
-| Component | Weight | Description |
-|---|---|---|
-| Berth utilization | 20% | Fraction of berths occupied |
-| Crane productivity | 20% | Actual moves vs 30 moves/crane/hour benchmark |
-| Vessel turnaround | 20% | Completion within target turnaround times |
-| Yard efficiency | 15% | Yard utilization in 50-80% sweet spot |
-| Truck turnaround | 10% | Fraction of trucks with < 60 min wait |
-| Rail utilization | 10% | Train fill rate vs 80% target |
-| Safety compliance | 5% | No hazmat/reefer violations |
+This is a dense, verifiable reward environment. Rewards are computed on each `advance_time` call. The agent is rewarded for keeping berths occupied, maintaining high crane productivity, completing vessels within target turnaround times, using yard space efficiently, minimizing truck wait times, filling trains before departure, and maintaining safety compliance. Conversely, idle resources, vessel delays, safety violations, and poor utilization are penalized.
 
 Final reward is the mean of all step rewards, clamped to [0, 1]. No LLM graders are used.
 

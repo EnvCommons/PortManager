@@ -187,16 +187,9 @@ Vessels: {status['vessels_departed']} departed / {status['vessels_total']} total
 9. **handle_disruption(disruption_id, action)** - Respond to active disruptions. Actions: "accept", "overtime" (+50% productivity, cost penalty), "reroute", "delay".
 10. **submit_plan()** - End episode and compute final reward.
 
-## REWARD STRUCTURE (dense, per-step on advance_time)
+## REWARD
 
-Your reward is a weighted combination of 7 components (all 0-1):
-- Berth utilization (20%): Keep berths occupied with vessels
-- Crane productivity (20%): Actual moves vs {CRANE_BASELINE_MPH:.0f}/hr benchmark
-- Vessel turnaround (20%): Complete vessels within target turnaround times
-- Yard efficiency (15%): Keep yard utilization 50-80% (penalty outside)
-- Truck turnaround (10%): Keep truck wait times under 60 minutes
-- Rail utilization (10%): Send trains with high fill rates
-- Safety/compliance (5%): No hazmat/reefer violations, no overcapacity
+You are rewarded for keeping berths occupied, maintaining high crane productivity, completing vessels promptly, using yard space efficiently, minimizing truck wait times, filling trains before departure, and maintaining safety compliance. You are penalized for idle resources, vessel delays, safety violations, and poor utilization of gates and rail.
 
 ## KEY CONSTRAINTS
 
@@ -207,7 +200,6 @@ Your reward is a weighted combination of 7 components (all 0-1):
 - Reefer containers MUST go to power blocks (YB01-04)
 - Hazmat containers MUST go to hazmat zones (YB19-20)
 
-Begin by observing the port status, then start assigning berths and cranes to waiting vessels.
 """
         return [TextBlock(text=prompt)]
 
