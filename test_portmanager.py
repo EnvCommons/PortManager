@@ -6,13 +6,15 @@ gate/rail operations, disruption handling, reward computation, edge cases,
 and deterministic replay.
 """
 
+from typing import Any, Callable, Dict, List
+
 import pytest
 
 from simulation import PortSimulation
 from models import (
     VesselType, VesselStatus, CraneStatus, ContainerType, DisruptionType,
     GateDirection, BERTH_CONFIGS, PLANNING_HORIZON, REWARD_WEIGHTS,
-    CRANE_BASELINE_MPH, WIND_CRANE_HALT_KNOTS, HAZMAT_BLOCKS,
+    CRANE_BASELINE_MPH, WIND_CRANE_HALT_KNOTS, HAZMAT_BLOCKS, OUTCOME_WEIGHT,
     REEFER_POWER_BLOCKS, NUM_YARD_BLOCKS, CRANE_DISTRIBUTION,
 )
 from scenarios import ALL_TASKS
@@ -792,17 +794,37 @@ class TestRewardComputation:
         sim.step_rewards.append(reward)
         assert reward["weighted_total"] >= 0.0
 
-    def test_final_reward_is_mean(self):
-        """Final reward should be the mean of step rewards."""
+    def test_final_reward_blends_hourly_score_and_outcomes(self):
+        """Final reward = hourly score blended with service actually delivered.
+
+        The hourly part is the mean over per-hour samples (not over the agent's
+        advance_time slices), and OUTCOME_WEIGHT of the score comes from ships
+        cleared and ships cleared on time.
+        """
         sim = PortSimulation(SMALL_CONFIG)
         for _ in range(5):
             sim.advance_to(sim.clock + 5.0)
-            step = sim.compute_step_reward()
-            sim.step_rewards.append(step)
+            sim.step_rewards.append(sim.compute_step_reward())
 
         final = sim.compute_final_reward()
-        expected_mean = sum(s["weighted_total"] for s in sim.step_rewards) / len(sim.step_rewards)
-        assert final["total_reward"] == pytest.approx(expected_mean, abs=0.001)
+        expected = ((1.0 - OUTCOME_WEIGHT) * final["hourly_score"]
+                    + OUTCOME_WEIGHT * final["outcome_score"])
+        assert final["total_reward"] == pytest.approx(expected, abs=0.001)
+
+        # The hourly part averages per-hour samples, so it must match a direct
+        # aggregation of them rather than the mean of the agent's step rewards.
+        direct = sim._aggregate_samples(sim.hourly_samples)["weighted_total"]
+        assert final["hourly_score"] == pytest.approx(direct, abs=0.001)
+
+    def test_outcome_score_tracks_service_delivered(self):
+        """Serving no ships must score 0 on the outcome half."""
+        sim = PortSimulation(SMALL_CONFIG)
+        for _ in range(5):
+            sim.advance_to(sim.clock + 5.0)
+            sim.step_rewards.append(sim.compute_step_reward())
+        final = sim.compute_final_reward()
+        assert final["vessels_completed"] == 0
+        assert final["outcome_score"] == pytest.approx(0.0, abs=1e-9)
 
 
 # ===========================================================================
@@ -1530,6 +1552,293 @@ class TestTideAndDraft:
 
 
 # ===========================================================================
+# O. SCRIPTED POLICY LADDER
+# ===========================================================================
+# Policies of increasing competence, used by the reward-discrimination tests
+# below. L0-L2 get progressively more capable; V3/V4 sound smarter (maximum
+# cranes plus relocation, and shortest-job-first) but measurably serve FEWER
+# ships, which is why the reward is expected to rank them below L2.
+#
+# Deterministic: the sim seeds off task_spec["seed"] and these make the same
+# choices every run, so each (task, policy) pair yields one reproducible number.
+
+LADDER_TASKS = [
+    "port_train_000",  # calm_week, 9 vessels
+    "port_train_001",  # calm_week, 8 vessels
+    "port_train_005",  # storm_season, 9 vessels
+    "port_train_006",  # storm_season, 10 vessels
+    "port_train_010",  # labor_dispute, 9 vessels — where overtime can pay off
+    "port_train_011",  # labor_dispute, 8 vessels
+    "port_train_015",  # peak_season, 13 vessels
+    "port_train_016",  # peak_season, 12 vessels
+]
+
+DEFAULT_STEP_HOURS = 6.0
+
+
+def _berth_waiting_vessels(sim: PortSimulation, tide_aware: bool = True) -> None:
+    for vessel in list(sim.vessels.values()):
+        if vessel.status != VesselStatus.WAITING:
+            continue
+        berth = _find_empty_berth(sim, vessel.draft_required_m)
+        if berth is None:
+            continue
+        if tide_aware and vessel.is_deep_draft and not sim.tide_high:
+            continue
+        sim.assign_berth(vessel.vessel_id, berth.berth_id)
+
+
+def _assign_local_cranes(sim: PortSimulation, up_to_max: bool = False) -> None:
+    """Assign idle cranes already standing at the vessel's own berth."""
+    for vessel in list(sim.vessels.values()):
+        if vessel.status != VesselStatus.BERTHED or vessel.remaining_moves <= 0:
+            continue
+        berth = sim.berths.get(vessel.berth_id)
+        if not berth:
+            continue
+        target = min(vessel.max_cranes, berth.max_cranes)
+        if not up_to_max and len(vessel.cranes_assigned) >= vessel.min_cranes:
+            continue
+        for crane in sim.cranes.values():
+            if (crane.berth_id == vessel.berth_id
+                    and crane.status == CraneStatus.IDLE
+                    and len(vessel.cranes_assigned) < target):
+                sim.assign_cranes(vessel.vessel_id, [crane.crane_id])
+
+
+def _relocate_idle_cranes(sim: PortSimulation) -> None:
+    """Pull idle cranes off empty berths toward vessels that are short-handed."""
+    for vessel in list(sim.vessels.values()):
+        if vessel.status != VesselStatus.BERTHED or vessel.remaining_moves <= 0:
+            continue
+        if len(vessel.cranes_assigned) >= vessel.min_cranes:
+            continue
+        if sim.wind_speed_knots >= WIND_CRANE_HALT_KNOTS:
+            continue
+        for crane in list(sim.cranes.values()):
+            if crane.status != CraneStatus.IDLE or crane.berth_id == vessel.berth_id:
+                continue
+            source = sim.berths.get(crane.berth_id)
+            if source and source.vessel_id is None:
+                sim.move_crane(crane.crane_id, vessel.berth_id)
+                break  # one move per pass, mirrors the smart loop in the tests
+
+
+def _set_yard_plans(sim: PortSimulation, segregate: bool = False) -> None:
+    for vessel in list(sim.vessels.values()):
+        if vessel.status != VesselStatus.BERTHED or vessel.yard_blocks_import:
+            continue
+        if segregate and vessel.reefer_count > 0:
+            blocks = [b.block_id for b in sim.yard_blocks.values()
+                      if b.has_power_points
+                      and b.current_occupancy < b.effective_capacity][:2]
+            if blocks:
+                sim.set_yard_plan(vessel.vessel_id, blocks, "reefer")
+        if segregate and vessel.hazmat_count > 0:
+            blocks = [b.block_id for b in sim.yard_blocks.values()
+                      if b.hazmat_zone
+                      and b.current_occupancy < b.effective_capacity][:2]
+            if blocks:
+                sim.set_yard_plan(vessel.vessel_id, blocks, "hazmat")
+        blocks = [b.block_id for b in sim.yard_blocks.values()
+                  if b.current_occupancy < b.effective_capacity
+                  and not b.hazmat_zone][:3]
+        if blocks:
+            sim.set_yard_plan(vessel.vessel_id, blocks, "dry")
+
+
+def _yard_utilization(sim: PortSimulation) -> float:
+    occ = sum(b.current_occupancy for b in sim.yard_blocks.values())
+    cap = sum(b.effective_capacity for b in sim.yard_blocks.values())
+    return occ / max(1, cap)
+
+
+def _dispatch_trucks(sim: PortSimulation, per_gate: int = 30) -> None:
+    """Drain the fullest yard blocks through the outbound gates.
+
+    The rate scales with yard occupancy: gates always run, but emptying the
+    yard is not free, since yard_efficiency wants occupancy in a 0.50-0.80
+    band.
+    """
+    per_gate = max(5, int(per_gate * _yard_utilization(sim)))
+    blocks = sorted(sim.yard_blocks.values(),
+                    key=lambda b: b.current_occupancy, reverse=True)
+    gates = [g for gid, g in sorted(sim.gate_lanes.items()) if gid.startswith("GO")]
+    for gate, block in zip(gates, blocks):
+        if block.current_occupancy <= 0:
+            continue
+        sim.dispatch_trucks(min(per_gate, block.current_occupancy),
+                            block.block_id, gate.lane_id)
+
+
+def _schedule_trains(sim: PortSimulation, lead_hours: float = 6.0,
+                     drain_above: float = 0.55) -> None:
+    """Book free tracks against the fullest blocks, when the yard needs it."""
+    if _yard_utilization(sim) < drain_above:
+        return
+    for track in sim.rail_tracks.values():
+        if track.scheduled_departure is not None:
+            continue
+        blocks = sorted(sim.yard_blocks.values(),
+                        key=lambda b: b.current_occupancy, reverse=True)
+        block_ids = [b.block_id for b in blocks[:3] if b.current_occupancy > 0]
+        if not block_ids:
+            continue
+        # A departed track is bookable again once turned around.
+        departure = max(sim.clock + lead_hours, track.available_from)
+        if departure >= sim.planning_horizon:
+            continue
+        sim.schedule_train(track.track_id, block_ids, departure)
+
+
+
+
+
+def _handle_disruptions(sim: PortSimulation) -> None:
+    """Pay for overtime only where it buys back lost productivity.
+
+    Overtime carries a cost, so it is worth it during a strike or breakdown
+    (which suppress the crane rate) but not during a storm, which halts cranes
+    outright no matter what you pay.
+    """
+    productivity_hits = {DisruptionType.LABOR_STRIKE,
+                         DisruptionType.EQUIPMENT_BREAKDOWN}
+    for d in sim.disruptions.values():
+        if not d.active or d.resolved or d.agent_action is not None:
+            continue
+        action = "overtime" if d.disruption_type in productivity_hits else "accept"
+        sim.handle_disruption(d.disruption_id, action)
+
+
+def policy_l0(sim: PortSimulation) -> None:
+    """Do nothing but let the clock run."""
+
+
+def policy_l1(sim: PortSimulation) -> None:
+    """Naive: berth whatever is waiting, put the minimum cranes on it."""
+    _berth_waiting_vessels(sim)
+    _assign_local_cranes(sim)
+
+
+def policy_l2(sim: PortSimulation) -> None:
+    """Decent: L1 plus yard plans, truck dispatch and rail departures."""
+    _berth_waiting_vessels(sim)
+    _assign_local_cranes(sim)
+    _set_yard_plans(sim)
+    _dispatch_trucks(sim)
+    _schedule_trains(sim)
+
+
+def policy_l3(sim: PortSimulation) -> None:
+    """Careful: L2 plus crane relocation, cargo segregation, disruption response."""
+    _berth_waiting_vessels(sim)
+    _assign_local_cranes(sim, up_to_max=True)
+    _relocate_idle_cranes(sim)
+    _set_yard_plans(sim, segregate=True)
+    _dispatch_trucks(sim)
+    _schedule_trains(sim)
+    _handle_disruptions(sim)
+
+
+def _serve_shortest_first(sim: PortSimulation) -> None:
+    """Crew up the ship closest to finishing, to clear berths sooner.
+
+    Shortest-processing-time first minimises mean flow time, so berths free up
+    for the queue instead of every ship crawling on minimum cranes.
+    """
+    berthed = [v for v in sim.vessels.values()
+               if v.status == VesselStatus.BERTHED and v.remaining_moves > 0]
+    for vessel in sorted(berthed, key=lambda v: v.remaining_moves):
+        berth = sim.berths.get(vessel.berth_id)
+        if not berth:
+            continue
+        target = min(vessel.max_cranes, berth.max_cranes)
+        for crane in sim.cranes.values():
+            if len(vessel.cranes_assigned) >= target:
+                break
+            if (crane.berth_id == vessel.berth_id
+                    and crane.status == CraneStatus.IDLE):
+                sim.assign_cranes(vessel.vessel_id, [crane.crane_id])
+        # Pull spare cranes off berths with no ship on them.
+        if len(vessel.cranes_assigned) < target:
+            for crane in list(sim.cranes.values()):
+                if len(vessel.cranes_assigned) >= target:
+                    break
+                if (crane.status == CraneStatus.IDLE
+                        and crane.berth_id != vessel.berth_id
+                        and sim.wind_speed_knots < WIND_CRANE_HALT_KNOTS):
+                    source = sim.berths.get(crane.berth_id)
+                    if source and source.vessel_id is None:
+                        sim.move_crane(crane.crane_id, vessel.berth_id)
+
+
+def policy_l4(sim: PortSimulation) -> None:
+    """Genuinely better: shortest-job-first crane allocation on top of L2.
+
+    Exists to answer whether the reward CAN see a real improvement. If a policy
+    that serves measurably more ships does not score higher, the reward is the
+    problem; if it does, earlier flat rungs were the problem.
+    """
+    _berth_waiting_vessels(sim)
+    _serve_shortest_first(sim)
+    _set_yard_plans(sim, segregate=True)
+    _dispatch_trucks(sim)
+    _schedule_trains(sim)
+    _handle_disruptions(sim)
+
+
+LADDER = [
+    ("L0 do-nothing", policy_l0),
+    ("L1 naive", policy_l1),
+    ("L2 decent", policy_l2),
+    ("V3 crane-heavy", policy_l3),
+    ("V4 shortest-first", policy_l4),
+]
+
+
+def run_policy(task: Dict[str, Any], policy: Callable[[PortSimulation], None],
+               step_hours: float = DEFAULT_STEP_HOURS) -> Dict[str, Any]:
+    """Drive one episode exactly the way portmanager.advance_time does.
+
+    Acts, advances, then records one step reward per advance — the same
+    sequence the real tool performs (portmanager.py:351-354) — so the ladder
+    measures the reward the agent would actually receive.
+    """
+    sim = PortSimulation(task)
+    while sim.clock < sim.planning_horizon:
+        policy(sim)
+        sim.advance_to(min(sim.clock + step_hours, sim.planning_horizon))
+        sim.step_rewards.append(sim.compute_step_reward())
+    return sim.compute_final_reward()
+
+
+def run_fixed_cadence(task: Dict[str, Any], policy: Callable[[PortSimulation], None],
+                      act_hours: float = 3.0, read_every: int = 1) -> Dict[str, Any]:
+    """Identical play, different reward-read cadence.
+
+    The policy acts on a fixed clock, so the episode unfolds identically; only
+    how often compute_step_reward is called varies. Any difference in the final
+    score is therefore a pure scoring artifact.
+    """
+    sim = PortSimulation(task)
+    tick = 0
+    while sim.clock < sim.planning_horizon:
+        policy(sim)
+        sim.advance_to(min(sim.clock + act_hours, sim.planning_horizon))
+        tick += 1
+        if tick % read_every == 0:
+            sim.step_rewards.append(sim.compute_step_reward())
+    return sim.compute_final_reward()
+
+
+def _tasks_by_id(ids: List[str]) -> List[Dict[str, Any]]:
+    index = {t["id"]: t for t in ALL_TASKS["train"] + ALL_TASKS["test"]}
+    missing = [i for i in ids if i not in index]
+    if missing:
+        raise SystemExit(f"unknown task ids: {missing}")
+    return [index[i] for i in ids]
+
+# ===========================================================================
 # N. REWARD DISCRIMINATION TESTS
 # ===========================================================================
 
@@ -1546,8 +1855,6 @@ class TestRewardDiscrimination:
         change, reading every 4th advance instead of every advance was worth up
         to +0.018 for free.
         """
-        from policy_ladder import run_fixed_cadence, policy_l2, _tasks_by_id
-
         task = _tasks_by_id(["port_train_000"])[0]
         scores = [run_fixed_cadence(task, policy_l2, read_every=n)["total_reward"]
                   for n in (1, 2, 4)]
@@ -1557,9 +1864,6 @@ class TestRewardDiscrimination:
     def test_better_policies_score_higher(self):
         """A do-nothing agent must lose clearly to a naive one, which must lose
         to one that also manages yard, trucks and rail."""
-        from policy_ladder import (run_policy, policy_l0, policy_l1, policy_l2,
-                                   _tasks_by_id)
-
         task = _tasks_by_id(["port_train_000"])[0]
         l0 = run_policy(task, policy_l0)["total_reward"]
         l1 = run_policy(task, policy_l1)["total_reward"]
@@ -1573,11 +1877,6 @@ class TestRewardDiscrimination:
         Raw berth occupancy did: finishing a vessel emptied its berth and cut
         the score, so putting maximum cranes on a ship was worth -0.005.
         """
-        from policy_ladder import _tasks_by_id, run_policy
-        from policy_ladder import (_berth_waiting_vessels, _assign_local_cranes,
-                                   _set_yard_plans, _dispatch_trucks,
-                                   _schedule_trains)
-
         def make(up_to_max):
             def p(sim):
                 _berth_waiting_vessels(sim)
