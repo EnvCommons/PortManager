@@ -43,9 +43,12 @@ from models import (
     NUM_GATE_LANES_OUT,
     NUM_RAIL_TRACKS,
     NUM_YARD_BLOCKS,
+    OVERTIME_HOURLY_COST,
     PLANNING_HORIZON,
+    RAIL_TRACK_TURNAROUND_HOURS,
     REEFER_POWER_BLOCKS,
     REWARD_WEIGHTS,
+    SAFETY_COMPONENT,
     STORM_GATE_THROUGHPUT_FACTOR,
     VESSEL_CONFIGS,
     WIND_CRANE_HALT_KNOTS,
@@ -85,6 +88,10 @@ class PortSimulation:
 
         # Tracking for rewards
         self.step_rewards: List[Dict[str, float]] = []
+        # One component sample per simulated hour. The episode reward is the
+        # mean over these, so it does not depend on how the agent slices time.
+        self.hourly_samples: List[Dict[str, float]] = []
+        self._samples_consumed: int = 0
         self.hourly_crane_moves: List[int] = []
         self.hourly_crane_working: List[int] = []
         self.truck_wait_times: List[float] = []
@@ -305,6 +312,11 @@ class PortSimulation:
                 break
             self._process_hourly_operations(h)
             self._last_processed_hour = h
+            # Sample the reward components every simulated hour, so the score
+            # integrates over time instead of snapshotting whenever the agent
+            # happens to stop advancing.
+            self.clock = h
+            self.hourly_samples.append(self._sample_components())
 
         self.clock = target_time
         return events_log
@@ -526,6 +538,10 @@ class PortSimulation:
         track.current_load_teu += total_loaded
         track.departed = True
         track.departure_actual = event.time
+        track.departures += 1
+        track.available_from = event.time + RAIL_TRACK_TURNAROUND_HOURS
+        # The booking has been consumed by this departure.
+        track.scheduled_departure = None
 
         fill_rate = track.current_load_teu / max(1, track.max_teu)
         self.trains_departed.append({
@@ -943,18 +959,44 @@ class PortSimulation:
             "gate_id": gate_id,
         }
 
+    def _describe_free_tracks(self) -> str:
+        """Tell the agent which tracks it can actually book right now."""
+        free = []
+        for t in sorted(self.rail_tracks.values(), key=lambda x: x.track_id):
+            if t.scheduled_departure is not None:
+                continue
+            if t.departed and t.available_from > self.clock:
+                continue
+            free.append(t.track_id)
+        if not free:
+            return "No tracks are free right now."
+        return f"Free now: {', '.join(free)}."
+
     def schedule_train(self, track_id: str, block_ids: List[str],
                       departure_hour: float) -> Dict[str, Any]:
         track = self.rail_tracks.get(track_id)
         if not track:
-            return {"error": f"Track {track_id} not found"}
-        if track.departed:
-            return {"error": f"Track {track_id} already departed"}
+            return {"error": f"Track {track_id} not found. Tracks: "
+                              f"{', '.join(sorted(self.rail_tracks))}"}
         if track.scheduled_departure is not None:
-            return {"error": f"Track {track_id} already scheduled for hour {track.scheduled_departure:.1f}"}
+            return {"error": f"Track {track_id} already scheduled for hour "
+                             f"{track.scheduled_departure:.1f}. "
+                             f"{self._describe_free_tracks()}"}
 
         if departure_hour <= self.clock:
             return {"error": f"Departure hour {departure_hour:.1f} must be after current time {self.clock:.1f}"}
+
+        if track.departed:
+            # The previous train has left; the track can take another once it
+            # has been turned around.
+            if departure_hour < track.available_from:
+                return {"error": f"Track {track_id} is being turned around after its "
+                                 f"departure at hour {track.departure_actual:.1f}; "
+                                 f"earliest next departure is hour {track.available_from:.1f}. "
+                                 f"{self._describe_free_tracks()}"}
+            track.departed = False
+            track.current_load_teu = 0
+            track.loading_from_blocks = []
 
         errors = []
         for bid in block_ids:
@@ -1003,7 +1045,7 @@ class PortSimulation:
         msg = f"Disruption {disruption_id} ({d.disruption_type.value}): action '{action}' applied."
 
         if action == "overtime":
-            self.overtime_penalty += 0.02  # 2% penalty to safety score per overtime
+            self.overtime_penalty += 0.02  # retained for reporting; cost is charged per active hour
             msg += " Productivity +50% but overtime costs incurred."
         elif action == "reroute":
             msg += " Operations rerouted where possible."
@@ -1066,6 +1108,8 @@ class PortSimulation:
                 "hazmat_count": v.hazmat_count,
                 "draft_required_m": v.draft_required_m,
                 "target_turnaround_hours": v.target_turnaround_hours,
+                "min_cranes": v.min_cranes,
+                "max_cranes": v.max_cranes,
                 "scheduled_arrival": v.scheduled_arrival,
                 "priority": v.priority,
             }
@@ -1159,23 +1203,96 @@ class PortSimulation:
     # ------------------------------------------------------------------
 
     def compute_step_reward(self) -> Dict[str, float]:
-        # 1. Berth utilization (0.20)
-        occupied = sum(1 for b in self.berths.values() if b.vessel_id is not None)
-        total_berths = len(self.berths)
-        berth_util = occupied / max(1, total_berths)
+        """Mean of the hourly samples taken since the last call.
+
+        This is the per-advance feedback the agent sees. The episode score
+        (compute_final_reward) averages every hourly sample instead, so it is
+        independent of how the agent chose to slice time.
+        """
+        fresh = self.hourly_samples[self._samples_consumed:]
+        self._samples_consumed = len(self.hourly_samples)
+        if not fresh:
+            # No simulated hour elapsed since the last call (e.g. two reward
+            # reads back to back) — fall back to an instantaneous sample.
+            fresh = [self._sample_components()]
+        return self._aggregate_samples(fresh)
+
+    def _aggregate_samples(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Average hourly samples, ignoring components that did not apply.
+
+        A component is None for an hour in which it has nothing to measure (no
+        vessel in port, no trucks moving). Each hour is scored only on the
+        components that applied to it, with their weights renormalised, so idle
+        time is neither rewarded nor punished — it simply is not scored.
+        """
+        out: Dict[str, Any] = {}
+        for key in list(REWARD_WEIGHTS) + [SAFETY_COMPONENT]:
+            vals = [s[key] for s in samples if s.get(key) is not None]
+            out[key] = round(sum(vals) / len(vals), 4) if vals else None
+
+        hourly_totals = []
+        for s in samples:
+            applicable = {k: w for k, w in REWARD_WEIGHTS.items()
+                          if s.get(k) is not None}
+            total_w = sum(applicable.values())
+            if not total_w:
+                continue
+            score = sum(w * s[k] for k, w in applicable.items()) / total_w
+            # Safety scales the whole hour rather than contributing a slice.
+            hourly_totals.append(score * s.get(SAFETY_COMPONENT, 1.0)
+                                 * (1.0 - s.get("overtime_cost", 0.0)))
+
+        out["weighted_total"] = round(
+            sum(hourly_totals) / len(hourly_totals), 4) if hourly_totals else 0.0
+        return out
+
+    def _sample_components(self) -> Dict[str, float]:
+        """Score every reward component against the current instant."""
+        # 1. Berth responsiveness: are ships left waiting when a berth they
+        # could actually use is standing empty?
+        #
+        # Raw occupancy (occupied/4) was structurally capped around 0.5 by the
+        # arrival schedule and, worse, rewarded holding a ship alongside —
+        # working a vessel faster emptied its berth and lowered the score,
+        # fighting vessel_turnaround. This measures only what the agent
+        # controls: ships it could have berthed and didn't.
+        waiting = [v for v in self.vessels.values()
+                   if v.status == VesselStatus.WAITING]
+        berthed = [v for v in self.vessels.values()
+                   if v.status == VesselStatus.BERTHED]
+        if not waiting and not berthed:
+            berth_util = None  # no ships in port this hour — nothing to score
+        elif not waiting:
+            berth_util = 1.0
+        else:
+            stranded = 0
+            for v in waiting:
+                if v.is_deep_draft and not self.tide_high:
+                    continue  # genuinely tide-blocked, not the agent's doing
+                if any(b.vessel_id is None and b.draft_m >= v.draft_required_m
+                       for b in self.berths.values()):
+                    stranded += 1
+            berth_util = 1.0 - stranded / len(waiting)
 
         # 2. Crane productivity (0.20)
         working_cranes = [c for c in self.cranes.values()
                          if c.status == CraneStatus.WORKING]
         if working_cranes:
             actual_moves = sum(c.actual_moves_this_hour for c in working_cranes)
-            benchmark = len(working_cranes) * CRANE_BASELINE_MPH
+            # Benchmark against the work that was actually there to do. Judging
+            # purely on cranes x 30 punished putting a third crane on a ship
+            # with only two cranes' worth of boxes left, even though that
+            # finishes it sooner and frees the berth.
+            available_work = sum(v.remaining_moves for v in self.vessels.values()
+                                 if v.status == VesselStatus.BERTHED)
+            benchmark = min(len(working_cranes) * CRANE_BASELINE_MPH,
+                            actual_moves + available_work)
             crane_prod = min(1.0, actual_moves / max(1, benchmark))
         elif any(v.status in (VesselStatus.BERTHED, VesselStatus.WAITING)
                  for v in self.vessels.values()):
             crane_prod = 0.0  # Penalty: vessels waiting but no cranes working
         else:
-            crane_prod = 0.5  # No vessels to work = neutral
+            crane_prod = None  # No vessels in port — nothing to be productive at
 
         # 3. Vessel turnaround (0.20)
         turnaround_scores = []
@@ -1200,7 +1317,10 @@ class PortSimulation:
                     wait_hours = self.clock - v.actual_arrival
                     score = max(0.0, 1.0 - wait_hours / 24.0)
                     turnaround_scores.append(score)
-        vessel_turn = (sum(turnaround_scores) / len(turnaround_scores)) if turnaround_scores else 0.3
+        # None, not a magic 0.3: before the first ship arrives there is no
+        # turnaround to judge.
+        vessel_turn = (sum(turnaround_scores) / len(turnaround_scores)
+                       if turnaround_scores else None)
 
         # 4. Yard efficiency (0.15)
         total_occ = sum(yb.current_occupancy for yb in self.yard_blocks.values())
@@ -1218,39 +1338,42 @@ class PortSimulation:
         if recent_waits:
             pct_under_60 = sum(1 for t in recent_waits if t <= 60.0) / len(recent_waits)
             truck_turn = pct_under_60
+        elif avg_util > 0.80:
+            # Yard is over its target band and nothing is being trucked out —
+            # that is a real failure, not an idle hour.
+            truck_turn = 0.0
         else:
-            truck_turn = 0.2  # low score for no truck activity
+            truck_turn = None  # no trucks moved yet, and none needed
 
         # 6. Rail utilization (0.10)
         if self.trains_departed:
             rail_scores = [min(1.0, t["fill_rate"] / 0.80) for t in self.trains_departed]
             rail_util = sum(rail_scores) / len(rail_scores)
+        elif avg_util > 0.80:
+            rail_util = 0.0  # congested yard, no rail being used to clear it
         else:
-            rail_util = 0.1  # Low score for no rail activity
+            rail_util = None  # no train has departed yet, and none needed
 
-        # 7. Safety / compliance (0.05)
+        # 7. Safety / compliance — a multiplier on the hour's score.
         violations = self._count_safety_violations()
-        safety = max(0.0, 1.0 - violations * 0.2 - self.overtime_penalty)
+        safety = max(0.0, 1.0 - violations * 0.2)
 
-        weighted = (
-            REWARD_WEIGHTS["berth_utilization"] * berth_util +
-            REWARD_WEIGHTS["crane_productivity"] * crane_prod +
-            REWARD_WEIGHTS["vessel_turnaround"] * vessel_turn +
-            REWARD_WEIGHTS["yard_efficiency"] * yard_eff +
-            REWARD_WEIGHTS["truck_turnaround"] * truck_turn +
-            REWARD_WEIGHTS["rail_utilization"] * rail_util +
-            REWARD_WEIGHTS["safety_compliance"] * safety
-        )
+        # Overtime is a labour cost, not a safety breach, and it is charged
+        # only for the hours it is actually being worked. Folding it into
+        # safety made one call at hour 30 bill every remaining hour of the week.
+        overtime_cost = OVERTIME_HOURLY_COST if any(
+            d.active and d.agent_action == "overtime"
+            for d in self.disruptions.values()) else 0.0
 
         return {
-            "berth_utilization": round(berth_util, 4),
-            "crane_productivity": round(crane_prod, 4),
-            "vessel_turnaround": round(vessel_turn, 4),
-            "yard_efficiency": round(yard_eff, 4),
-            "truck_turnaround": round(truck_turn, 4),
-            "rail_utilization": round(rail_util, 4),
-            "safety_compliance": round(safety, 4),
-            "weighted_total": round(weighted, 4),
+            "berth_responsiveness": berth_util,
+            "crane_productivity": crane_prod,
+            "vessel_turnaround": vessel_turn,
+            "yard_efficiency": yard_eff,
+            "truck_turnaround": truck_turn,
+            "rail_utilization": rail_util,
+            "safety_compliance": safety,
+            "overtime_cost": overtime_cost,
         }
 
     def compute_final_reward(self) -> Dict[str, Any]:
@@ -1258,14 +1381,15 @@ class PortSimulation:
             # Compute at least one step reward
             self.step_rewards.append(self.compute_step_reward())
 
-        mean_reward = sum(s["weighted_total"] for s in self.step_rewards) / len(self.step_rewards)
-        mean_reward = max(0.0, min(1.0, mean_reward))
+        # Score the episode off the per-hour samples, not the agent's chosen
+        # advance_time slices — otherwise a 1-hour step counts as much as a
+        # 12-hour one and the score depends on how time was carved up.
+        basis = self.hourly_samples or [self._sample_components()]
+        aggregate = self._aggregate_samples(basis)
+        mean_reward = max(0.0, min(1.0, aggregate["weighted_total"]))
 
-        # Component averages
-        components = {}
-        for key in REWARD_WEIGHTS:
-            vals = [s.get(key, 0.0) for s in self.step_rewards]
-            components[f"avg_{key}"] = round(sum(vals) / len(vals), 4)
+        components = {f"avg_{key}": aggregate[key]
+                      for key in list(REWARD_WEIGHTS) + [SAFETY_COMPONENT]}
 
         vessels_completed = sum(1 for v in self.vessels.values()
                                if v.status == VesselStatus.DEPARTED)

@@ -26,6 +26,7 @@ from models import (
     PLANNING_HORIZON,
     REEFER_POWER_BLOCKS,
     REWARD_WEIGHTS,
+    SAFETY_COMPONENT,
     VESSEL_CONFIGS,
     WIND_CRANE_HALT_KNOTS,
     VesselType,
@@ -373,18 +374,22 @@ class TestGeneralParameterCitations:
         assert PLANNING_HORIZON / 24.0 == 7.0  # Exactly 1 week
 
     def test_reward_weights_sum_to_one(self):
-        """7 reward components must sum to 1.0 for proper weighting."""
+        """The 6 additive reward components must sum to 1.0.
+
+        safety_compliance is deliberately absent: it multiplies the weighted
+        total instead of contributing a slice of it (models.py SAFETY_COMPONENT).
+        """
         total = sum(REWARD_WEIGHTS.values())
         assert total == pytest.approx(1.0, abs=0.001)
 
     def test_reward_components_present(self):
-        """All 7 documented reward components should be defined."""
+        """All 6 additive reward components should be defined."""
         expected = {
-            "berth_utilization", "crane_productivity", "vessel_turnaround",
+            "berth_responsiveness", "crane_productivity", "vessel_turnaround",
             "yard_efficiency", "truck_turnaround", "rail_utilization",
-            "safety_compliance",
         }
         assert set(REWARD_WEIGHTS.keys()) == expected
+        assert SAFETY_COMPONENT not in REWARD_WEIGHTS
 
     def test_task_counts(self):
         """30 training tasks + 10 test tasks = 40 total."""

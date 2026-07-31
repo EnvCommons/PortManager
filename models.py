@@ -221,6 +221,10 @@ class RailTrack:
     loading_from_blocks: List[str] = field(default_factory=list)
     departed: bool = False
     departure_actual: Optional[float] = None
+    # A track is infrastructure, not a single train: once a train leaves and
+    # the track is turned around, it can carry another.
+    available_from: float = 0.0
+    departures: int = 0
 
 
 @dataclass
@@ -308,6 +312,7 @@ REEFER_POWER_BLOCKS = {"YB01", "YB02", "YB03", "YB04"}  # First 4 have power
 NUM_GATE_LANES_IN = 4
 NUM_GATE_LANES_OUT = 4
 NUM_RAIL_TRACKS = 4
+RAIL_TRACK_TURNAROUND_HOURS = 6.0  # clearing a departed train off the track
 
 # Disruption thresholds
 WIND_CRANE_HALT_KNOTS = 40.0
@@ -329,13 +334,26 @@ DEFAULT_VESSEL_MIX = {
     VesselType.ULCV: 0.10,
 }
 
-# Reward weights
+# Reward weights. Weight sits where the agent has controllable, low-noise
+# influence: berth_responsiveness and vessel_turnaround are the two things a
+# terminal is actually judged on, and yard_efficiency is demoted because its
+# 0.50-0.80 target band is a wide plateau with little gradient inside it.
 REWARD_WEIGHTS = {
-    "berth_utilization": 0.20,
+    "berth_responsiveness": 0.25,
     "crane_productivity": 0.20,
-    "vessel_turnaround": 0.20,
-    "yard_efficiency": 0.15,
+    "vessel_turnaround": 0.25,
+    "yard_efficiency": 0.10,
     "truck_turnaround": 0.10,
     "rail_utilization": 0.10,
-    "safety_compliance": 0.05,
 }
+
+# Safety is a multiplier on the weighted total, not one more additive slice.
+# As a 0.05 component it was inert (0.99+ every episode, under 1% of the
+# score's variance), so a violation cost almost nothing; as a multiplier it
+# scales the whole hour's reward.
+SAFETY_COMPONENT = "safety_compliance"
+
+# Charged for each hour overtime is actually being worked, so the decision is a
+# real trade-off: worth paying when it buys back suppressed productivity (a
+# strike), not worth it otherwise.
+OVERTIME_HOURLY_COST = 0.05
