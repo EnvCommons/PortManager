@@ -43,6 +43,7 @@ from models import (
     NUM_GATE_LANES_OUT,
     NUM_RAIL_TRACKS,
     NUM_YARD_BLOCKS,
+    OUTCOME_WEIGHT,
     OVERTIME_HOURLY_COST,
     PLANNING_HORIZON,
     RAIL_TRACK_TURNAROUND_HOURS,
@@ -1386,19 +1387,41 @@ class PortSimulation:
         # 12-hour one and the score depends on how time was carved up.
         basis = self.hourly_samples or [self._sample_components()]
         aggregate = self._aggregate_samples(basis)
-        mean_reward = max(0.0, min(1.0, aggregate["weighted_total"]))
+        hourly_score = max(0.0, min(1.0, aggregate["weighted_total"]))
 
         components = {f"avg_{key}": aggregate[key]
                       for key in list(REWARD_WEIGHTS) + [SAFETY_COMPONENT]}
 
-        vessels_completed = sum(1 for v in self.vessels.values()
-                               if v.status == VesselStatus.DEPARTED)
+        departed = [v for v in self.vessels.values()
+                    if v.status == VesselStatus.DEPARTED]
+        vessels_completed = len(departed)
+        total_vessels = max(1, len(self.vessels))
+        on_time = sum(
+            1 for v in departed
+            if v.departure_time is not None and v.berthing_time is not None
+            and (v.departure_time - v.berthing_time) <= v.target_turnaround_hours
+        )
+
+        # Service actually delivered. The hourly rates are near-blind to this:
+        # serving 5.4 of 10 ships instead of 6.5 moved them by 0.004, a fifth of
+        # the run-to-run noise, so the score could not tell the two apart.
+        service_rate = vessels_completed / total_vessels
+        on_time_rate = on_time / total_vessels
+        outcome_score = 0.5 * service_rate + 0.5 * on_time_rate
+
+        mean_reward = round((1.0 - OUTCOME_WEIGHT) * hourly_score
+                            + OUTCOME_WEIGHT * outcome_score, 4)
         total_moves = sum(c.total_moves for c in self.cranes.values())
 
         return {
-            "total_reward": round(mean_reward, 4),
+            "total_reward": mean_reward,
+            "hourly_score": round(hourly_score, 4),
+            "outcome_score": round(outcome_score, 4),
+            "service_rate": round(service_rate, 4),
+            "on_time_rate": round(on_time_rate, 4),
             "num_steps": len(self.step_rewards),
             "vessels_completed": vessels_completed,
+            "vessels_on_time": on_time,
             "vessels_total": len(self.vessels),
             "total_crane_moves": total_moves,
             "trains_departed": len(self.trains_departed),

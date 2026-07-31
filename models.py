@@ -357,3 +357,15 @@ SAFETY_COMPONENT = "safety_compliance"
 # real trade-off: worth paying when it buys back suppressed productivity (a
 # strike), not worth it otherwise.
 OVERTIME_HOURLY_COST = 0.05
+
+# The hourly components are all time-averaged rates, which compress: serving one
+# fewer ship out of ten barely moved them. Episode outcomes — ships cleared, and
+# ships cleared inside their target turnaround — carry the dynamic range that
+# distinguishes good operation, so the episode score blends them in.
+#
+# Chosen by sweep (policy_ladder.py): rank correlation between the score and
+# real service delivered rises 0.53 (weight 0) -> 0.73 -> 0.84 -> 0.93 (0.45)
+# -> 0.97 (0.60). Stopped at 0.45 so the dense per-hour shaping stays the
+# majority of the score; raising it further trades credit assignment for
+# fidelity.
+OUTCOME_WEIGHT = 0.45
