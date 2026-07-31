@@ -735,6 +735,11 @@ class TestRewardComputation:
         _greedy_dispatch_loop(sim, duration=24.0)
         reward = sim.compute_step_reward()
         for key in REWARD_WEIGHTS:
+            # None means the component had nothing to measure that hour (no
+            # ship in port, no trucks moving); it is excluded from the total
+            # rather than scored as mediocre.
+            if reward[key] is None:
+                continue
             assert 0.0 <= reward[key] <= 1.0, f"{key} out of range: {reward[key]}"
         assert 0.0 <= reward["weighted_total"] <= 1.0
 
@@ -1239,9 +1244,21 @@ class TestDisruptionImpact:
         # With noise: ~19-26
 
     def test_disruption_scenario_lower_reward_than_calm(self):
-        """Storm scenario should produce lower greedy reward than calm."""
+        """Adding a storm should lower the greedy reward.
+
+        The two configs differ ONLY in the disruption. Comparing CALM_CONFIG to
+        STORM_CONFIG directly would also vary yard_initial_occupancy (0.40 vs
+        0.45), and since yard_efficiency targets a 0.50-0.80 band, that
+        difference alone can outweigh the storm.
+        """
+        stormy = dict(CALM_CONFIG)
+        stormy["disruptions"] = [
+            {"type": "storm", "start_hour": 5.0, "end_hour": 10.0,
+             "severity": 0.9, "details": {"wind_knots": 50.0}},
+        ]
+
         sim_calm = PortSimulation(CALM_CONFIG)
-        sim_storm = PortSimulation(STORM_CONFIG)
+        sim_storm = PortSimulation(stormy)
 
         _greedy_dispatch_loop(sim_calm)
         _greedy_dispatch_loop(sim_storm)
@@ -1510,3 +1527,69 @@ class TestTideAndDraft:
         # Just verify it completed eventually
         assert vessel.status in (VesselStatus.DEPARTING, VesselStatus.DEPARTED), \
             f"Deep-draft vessel stuck in status {vessel.status.value}"
+
+
+# ===========================================================================
+# N. REWARD DISCRIMINATION TESTS
+# ===========================================================================
+
+class TestRewardDiscrimination:
+    """The reward must separate better play from worse play, and must not
+    depend on how the agent slices time. See policy_ladder.py for the full
+    measurement harness."""
+
+    def test_reward_independent_of_reward_read_cadence(self):
+        """Identical play must score identically however often rewards are read.
+
+        The episode score averages per-hour samples, so calling
+        compute_step_reward more or less often cannot change it. Before that
+        change, reading every 4th advance instead of every advance was worth up
+        to +0.018 for free.
+        """
+        from policy_ladder import run_fixed_cadence, policy_l2, _tasks_by_id
+
+        task = _tasks_by_id(["port_train_000"])[0]
+        scores = [run_fixed_cadence(task, policy_l2, read_every=n)["total_reward"]
+                  for n in (1, 2, 4)]
+        assert max(scores) - min(scores) == pytest.approx(0.0, abs=1e-9), \
+            f"score varied with read cadence: {scores}"
+
+    def test_better_policies_score_higher(self):
+        """A do-nothing agent must lose clearly to a naive one, which must lose
+        to one that also manages yard, trucks and rail."""
+        from policy_ladder import (run_policy, policy_l0, policy_l1, policy_l2,
+                                   _tasks_by_id)
+
+        task = _tasks_by_id(["port_train_000"])[0]
+        l0 = run_policy(task, policy_l0)["total_reward"]
+        l1 = run_policy(task, policy_l1)["total_reward"]
+        l2 = run_policy(task, policy_l2)["total_reward"]
+        assert l0 < l1, f"do-nothing ({l0:.4f}) should lose to naive ({l1:.4f})"
+        assert l1 <= l2, f"naive ({l1:.4f}) should not beat managed ({l2:.4f})"
+
+    def test_working_a_ship_faster_is_not_punished(self):
+        """Berth scoring must not reward holding a ship alongside.
+
+        Raw berth occupancy did: finishing a vessel emptied its berth and cut
+        the score, so putting maximum cranes on a ship was worth -0.005.
+        """
+        from policy_ladder import _tasks_by_id, run_policy
+        from policy_ladder import (_berth_waiting_vessels, _assign_local_cranes,
+                                   _set_yard_plans, _dispatch_trucks,
+                                   _schedule_trains)
+
+        def make(up_to_max):
+            def p(sim):
+                _berth_waiting_vessels(sim)
+                _assign_local_cranes(sim, up_to_max=up_to_max)
+                _set_yard_plans(sim)
+                _dispatch_trucks(sim)
+                _schedule_trains(sim)
+            return p
+
+        task = _tasks_by_id(["port_train_001"])[0]
+        min_cranes = run_policy(task, make(False))["total_reward"]
+        max_cranes = run_policy(task, make(True))["total_reward"]
+        assert max_cranes >= min_cranes - 0.001, \
+            (f"using more cranes scored worse ({max_cranes:.4f} vs "
+             f"{min_cranes:.4f}) — berth scoring is rewarding idle ships")

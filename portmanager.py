@@ -14,7 +14,8 @@ from pydantic import BaseModel
 from openreward.environments import Environment, JSONObject, ToolOutput, tool, TextBlock
 from simulation import PortSimulation, CRANE_BASELINE_MPH
 from scenarios import ALL_TASKS
-from models import PLANNING_HORIZON, REWARD_WEIGHTS, BERTH_CONFIGS
+from models import (PLANNING_HORIZON, RAIL_TRACK_TURNAROUND_HOURS,
+                    REWARD_WEIGHTS, SAFETY_COMPONENT, BERTH_CONFIGS)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +121,8 @@ class PortManager(Environment):
         vessel_lines = []
         for v in status["vessels"]:
             line = (f"  - {v['vessel_id']}: {v['type']}, {v['teu_capacity']} TEU, "
-                    f"status={v['status']}, draft={v['draft_required_m']}m")
+                    f"status={v['status']}, draft={v['draft_required_m']}m, "
+                    f"takes {v['min_cranes']}-{v['max_cranes']} cranes")
             if v["status"] == "scheduled":
                 line += f", arrives ~hr {v.get('actual_arrival', v['scheduled_arrival']):.1f}"
             elif v["status"] == "waiting":
@@ -161,7 +163,7 @@ class PortManager(Environment):
 - Current overall utilization: {status['yard_summary']['utilization_pct']}%
 
 ### Gates (4 inbound + 4 outbound lanes, 30 trucks/hr/lane)
-### Rail (4 tracks, 120 TEU max per train)
+### Rail (4 tracks, 120 TEU max per train; a track can run another train {RAIL_TRACK_TURNAROUND_HOURS:.0f}h after a departure)
 
 ## CURRENT STATE (hour {status['clock']:.1f} / {status['planning_horizon']:.0f})
 
@@ -178,7 +180,7 @@ Vessels: {status['vessels_departed']} departed / {status['vessels_total']} total
 
 1. **observe_port()** - Get full snapshot of berths, cranes, yard, gates, rail, weather, disruptions
 2. **assign_berth(vessel_id, berth_id)** - Dock a waiting vessel. Validates draft depth, berth availability, and tide (deep-draft vessels need high tide).
-3. **assign_cranes(vessel_id, crane_ids)** - Assign idle cranes to a berthed vessel. Cranes must be at the same berth.
+3. **assign_cranes(vessel_id, crane_ids)** - Assign idle cranes to a berthed vessel. Cranes must be at the same berth, and each vessel has its own crane limit (shown per vessel above) that is often lower than the berth's.
 4. **move_crane(crane_id, berth_id)** - Relocate a crane to a different berth (takes 1 hour). Blocked during storms.
 5. **set_yard_plan(vessel_id, yard_block_ids, container_type)** - Designate yard blocks for containers. Reefer needs power blocks (YB01-04), hazmat needs hazmat zones (YB19-20).
 6. **dispatch_trucks(count, yard_block_id, gate_id)** - Route trucks between yard and gate for pickup/delivery.
@@ -241,7 +243,12 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
 
     @tool
     async def assign_cranes(self, params: AssignCranesParams) -> ToolOutput:
-        """Assign idle cranes to a berthed vessel. Cranes must be at the same berth."""
+        """Assign idle cranes to a berthed vessel. Cranes must be at the same berth.
+
+        Each vessel has its own crane limit (see cranes=used/max on the vessel
+        lines), which is usually lower than the berth's limit. The assignment
+        fails if either cap would be exceeded.
+        """
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
@@ -455,7 +462,7 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
             line = f"  {v['vessel_id']:5s} | {v['type']:12s} | {v['teu_capacity']:5d} TEU | {v['status']:10s}"
             if v["status"] == "berthed":
                 line += (f" | berth={v.get('berth_id', '?')}, "
-                        f"cranes={len(v.get('cranes_assigned', []))}, "
+                        f"cranes={len(v.get('cranes_assigned', []))}/{v['max_cranes']}, "
                         f"remaining={v['remaining_moves']}")
             elif v["status"] == "waiting":
                 line += f" | draft={v['draft_required_m']}m"
@@ -524,8 +531,12 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
     def _format_step_reward(self, reward: dict) -> str:
         lines = ["Step Reward Breakdown:"]
         for key, weight in REWARD_WEIGHTS.items():
-            val = reward.get(key, 0.0)
-            lines.append(f"  {key:25s}: {val:.4f} (weight {weight:.0%})")
+            val = reward.get(key)
+            shown = "n/a (nothing to score)" if val is None else f"{val:.4f}"
+            lines.append(f"  {key:25s}: {shown} (weight {weight:.0%})")
+        safety = reward.get(SAFETY_COMPONENT)
+        if safety is not None:
+            lines.append(f"  {SAFETY_COMPONENT:25s}: {safety:.4f} (multiplier)")
         lines.append(f"  {'WEIGHTED TOTAL':25s}: {reward['weighted_total']:.4f}")
         return "\n".join(lines)
 
@@ -544,9 +555,10 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
             "",
             "Component Averages:",
         ]
-        for key in REWARD_WEIGHTS:
-            avg_key = f"avg_{key}"
-            val = reward.get(avg_key, 0.0)
-            lines.append(f"  {key:25s}: {val:.4f}")
+        for key in list(REWARD_WEIGHTS) + [SAFETY_COMPONENT]:
+            val = reward.get(f"avg_{key}")
+            shown = "n/a (never applicable)" if val is None else f"{val:.4f}"
+            suffix = "  (multiplier)" if key == SAFETY_COMPONENT else ""
+            lines.append(f"  {key:25s}: {shown}{suffix}")
         lines.append("=" * 55)
         return "\n".join(lines)
