@@ -47,9 +47,39 @@ Each task simulates a 168-hour (1-week) planning horizon with 6-14 vessel arriva
 
 ## Reward Structure
 
-This is a dense, verifiable reward environment. Rewards are computed on each `advance_time` call. The agent is rewarded for keeping berths occupied, maintaining high crane productivity, completing vessels within target turnaround times, using yard space efficiently, minimizing truck wait times, filling trains before departure, and maintaining safety compliance. Conversely, idle resources, vessel delays, safety violations, and poor utilization are penalized.
+This is a dense, verifiable reward environment. No LLM graders are used. Each
+`advance_time` call returns a score for the hours it advanced through, and the
+episode score combines two parts:
 
-Final reward is the mean of all step rewards, clamped to [0, 1]. No LLM graders are used.
+**Hourly components (55%).** Sampled once per *simulated hour* — not once per
+`advance_time` call — so the score does not depend on how the agent slices time:
+
+| component | weight | measures |
+|---|---|---|
+| berth_responsiveness | 0.25 | ships left waiting while a berth they could use sits empty |
+| vessel_turnaround | 0.25 | ships worked within their target turnaround |
+| crane_productivity | 0.20 | moves achieved against the work available |
+| yard_efficiency | 0.10 | yard occupancy held in a 0.50-0.80 band |
+| truck_turnaround | 0.10 | share of trucks served within 60 minutes |
+| rail_utilization | 0.10 | fill rate of departed trains |
+
+A component reads `n/a` for hours where it has nothing to measure (no ship in
+port, no trucks moving); those hours are scored on the remaining components with
+weights renormalised, so idle time is neither rewarded nor punished.
+`safety_compliance` multiplies the hour's score rather than adding to it, and
+overtime is charged for each hour it is worked.
+
+Note that berth *responsiveness* is deliberately not berth *occupancy*: rewarding
+occupancy penalised working a ship faster, because finishing it emptied the berth.
+
+**Episode outcomes (45%).** Ships cleared, and ships cleared inside their target
+turnaround. The hourly components are all time-averaged rates and compress
+heavily, so serving one fewer ship out of ten barely moved them; these terms are
+what make service actually delivered visible in the score.
+
+Only `advance_time` and `submit_plan` carry a reward. Other tools leave it unset
+rather than returning 0.0, so a stream of zeros cannot dilute a `mean` or `min`
+reduction over step rewards.
 
 ## Tools
 
