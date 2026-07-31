@@ -1892,3 +1892,55 @@ class TestRewardDiscrimination:
         assert max_cranes >= min_cranes - 0.001, \
             (f"using more cranes scored worse ({max_cranes:.4f} vs "
              f"{min_cranes:.4f}) — berth scoring is rewarding idle ships")
+
+
+# ===========================================================================
+# P. TOOL REWARD CONVENTION
+# ===========================================================================
+
+class TestToolRewardConvention:
+    """Only the scoring tools may carry a reward.
+
+    The trainer collects non-None step rewards and reduces them
+    (reward_reduction). A stream of explicit 0.0s from non-scoring tools is
+    invisible under `sum` but dilutes `mean` about sixfold and pins `min` to
+    0.0, so non-scoring tools must leave reward unset.
+    """
+
+    def _env(self):
+        pytest.importorskip("openreward")
+        import asyncio
+        from portmanager import PortManager
+        return asyncio.run, PortManager(dict(CALM_CONFIG))
+
+    def test_non_scoring_tools_leave_reward_unset(self):
+        run, env = self._env()
+        from portmanager import (ObservePortParams, AssignBerthParams,
+                                 ScheduleTrainParams)
+
+        assert run(env.observe_port(ObservePortParams())).reward is None
+        # Both the success and the failure path must stay unset.
+        assert run(env.assign_berth(
+            AssignBerthParams(vessel_id="V001", berth_id="B1"))).reward is None
+        assert run(env.assign_berth(
+            AssignBerthParams(vessel_id="nope", berth_id="B1"))).reward is None
+        assert run(env.schedule_train(ScheduleTrainParams(
+            track_id="RT99", yard_block_ids=["YB01"],
+            departure_hour=20.0))).reward is None
+
+    def test_advance_time_carries_reward(self):
+        run, env = self._env()
+        from portmanager import AdvanceTimeParams
+        out = run(env.advance_time(AdvanceTimeParams(hours=6)))
+        assert out.reward is not None
+        assert 0.0 <= out.reward <= 1.0
+
+    def test_tools_after_episode_end_leave_reward_unset(self):
+        """The terminal reward is delivered once; later calls add nothing."""
+        run, env = self._env()
+        from portmanager import (AdvanceTimeParams, ObservePortParams,
+                                 SubmitPlanParams)
+        final = run(env.submit_plan(SubmitPlanParams()))
+        assert final.reward is not None and final.finished
+        assert run(env.observe_port(ObservePortParams())).reward is None
+        assert run(env.advance_time(AdvanceTimeParams(hours=6))).reward is None

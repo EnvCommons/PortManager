@@ -79,7 +79,14 @@ class SubmitPlanParams(BaseModel, extra="forbid"):
 # ---------------------------------------------------------------------------
 
 class PortManager(Environment):
-    """Container port terminal management environment."""
+    """Container port terminal management environment.
+
+    Reward convention: only advance_time and submit_plan carry a reward. Every
+    other tool leaves it unset (None) rather than returning 0.0, because the
+    trainer collects non-None step rewards and reduces them (rl.py's
+    reward_reduction) — a stream of explicit zeros is invisible under `sum` but
+    dilutes `mean` about sixfold and pins `min` to 0.0.
+    """
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
         super().__init__(task_spec)
@@ -213,13 +220,13 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         status = self.sim.get_port_status()
         text = self._format_port_status(status)
         return ToolOutput(
             blocks=[TextBlock(text=text)],
-            metadata=status, reward=0.0, finished=False
+            metadata=status, finished=False
         )
 
     @tool
@@ -228,17 +235,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.assign_berth(params.vessel_id, params.berth_id)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Berth assignment failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -252,17 +259,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.assign_cranes(params.vessel_id, params.crane_ids)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Crane assignment failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -271,17 +278,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.move_crane(params.crane_id, params.berth_id)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Crane move failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -290,17 +297,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.set_yard_plan(params.vessel_id, params.yard_block_ids, params.container_type)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Yard plan failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -309,17 +316,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.dispatch_trucks(params.count, params.yard_block_id, params.gate_id)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Truck dispatch failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -328,17 +335,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.schedule_train(params.track_id, params.yard_block_ids, params.departure_hour)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Train scheduling failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -347,12 +354,12 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         if params.hours < 1 or params.hours > 12:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Hours must be 1-12 (got {params.hours}).")],
-                metadata={"error": "invalid_hours"}, reward=0.0, finished=False
+                metadata={"error": "invalid_hours"}, finished=False
             )
 
         target = self.sim.clock + params.hours
@@ -392,17 +399,17 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation has ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         result = self.sim.handle_disruption(params.disruption_id, params.action)
         if "error" in result:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Disruption handling failed: {result['error']}")],
-                metadata=result, reward=0.0, finished=False
+                metadata=result, finished=False
             )
         return ToolOutput(
             blocks=[TextBlock(text=result["message"])],
-            metadata=result, reward=0.0, finished=False
+            metadata=result, finished=False
         )
 
     @tool
@@ -411,7 +418,7 @@ You are rewarded for keeping berths occupied, maintaining high crane productivit
         if self.finished:
             return ToolOutput(
                 blocks=[TextBlock(text="Simulation already ended.")],
-                metadata={"error": "finished"}, reward=0.0, finished=True
+                metadata={"error": "finished"}, finished=True
             )
         # Compute one more step reward if needed
         if not self.sim.step_rewards:
