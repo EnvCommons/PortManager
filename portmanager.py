@@ -198,7 +198,17 @@ Vessels: {status['vessels_departed']} departed / {status['vessels_total']} total
 
 ## REWARD
 
-You are rewarded for keeping berths occupied, maintaining high crane productivity, completing vessels promptly, using yard space efficiently, minimizing truck wait times, filling trains before departure, and maintaining safety compliance. You are penalized for idle resources, vessel delays, safety violations, and poor utilization of gates and rail.
+Your score is 45% the service you deliver over the week — ships cleared, and ships cleared inside their target turnaround — and 55% how well you run the port hour by hour:
+
+- **berth_responsiveness** ({REWARD_WEIGHTS['berth_responsiveness']:.0%}): do not leave a ship waiting when a berth it can use is empty. Note this rewards *moving ships through*, not holding them alongside — freeing a berth early is good, not bad.
+- **vessel_turnaround** ({REWARD_WEIGHTS['vessel_turnaround']:.0%}): work each ship within its target turnaround hours.
+- **crane_productivity** ({REWARD_WEIGHTS['crane_productivity']:.0%}): moves achieved against the work actually available. Assigning more cranes than a ship has cargo left for is not penalised, but idle cranes at an empty berth do nothing for you.
+- **yard_efficiency** ({REWARD_WEIGHTS['yard_efficiency']:.0%}): keep yard occupancy between 50% and 80% — both overflowing and emptying it cost you.
+- **truck_turnaround** ({REWARD_WEIGHTS['truck_turnaround']:.0%}): serve trucks within 60 minutes.
+- **rail_utilization** ({REWARD_WEIGHTS['rail_utilization']:.0%}): send trains well filled (80%+ of 120 TEU).
+- **safety_compliance**: multiplies everything above, so a violation is expensive. Overtime is charged for each hour you run it, so use it only where it buys back lost productivity.
+
+A component shows `n/a` for hours where it has nothing to measure (no ship in port, no trucks moving); those hours are scored on the remaining components.
 
 ## KEY CONSTRAINTS
 
