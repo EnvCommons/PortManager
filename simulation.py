@@ -316,8 +316,13 @@ class PortSimulation:
             # Sample the reward components every simulated hour, so the score
             # integrates over time instead of snapshotting whenever the agent
             # happens to stop advancing.
+            #
+            # Hour 0 is the starting instant, before any time has elapsed;
+            # sampling it would give a 168-hour week 169 samples and make
+            # `progress_share` (hours / planning_horizon) fail to sum to 1.
             self.clock = h
-            self.hourly_samples.append(self._sample_components())
+            if h >= 1.0:
+                self.hourly_samples.append(self._sample_components())
 
         self.clock = target_time
         return events_log
@@ -1212,11 +1217,34 @@ class PortSimulation:
         """
         fresh = self.hourly_samples[self._samples_consumed:]
         self._samples_consumed = len(self.hourly_samples)
+        interval_hours = len(fresh)
         if not fresh:
             # No simulated hour elapsed since the last call (e.g. two reward
-            # reads back to back) — fall back to an instantaneous sample.
+            # reads back to back) — fall back to an instantaneous sample, and
+            # credit no progress for it.
             fresh = [self._sample_components()]
-        return self._aggregate_samples(fresh)
+        out = self._aggregate_samples(fresh)
+
+        # The step rewards are designed to be SUMMED over the episode. Each
+        # interval banks the hourly share for the hours it covered, and the
+        # terminal step banks the outcome share (compute_final_reward's
+        # `outcome_credit`); nothing is counted twice.
+        #
+        # The sum approaches `total_reward` but does not equal it exactly:
+        # `hourly_score` averages over hours that HAD something to score, while
+        # this divides by the whole horizon, so hours when the port sat empty
+        # bank nothing. Running a busier port therefore banks more, which is
+        # the intended behaviour.
+        #
+        # Two properties this is for: an agent that stops at hour 80 banks
+        # roughly half the hourly share, and the banked total does not depend
+        # on whether it advanced in 1-hour or 12-hour steps (verified exact to
+        # rounding when play is held fixed).
+        out["interval_hours"] = interval_hours
+        out["progress_share"] = round(interval_hours / self.planning_horizon, 6)
+        out["progress_credit"] = round(
+            (1.0 - OUTCOME_WEIGHT) * out["totals_sum"] / self.planning_horizon, 6)
+        return out
 
     def _aggregate_samples(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Average hourly samples, ignoring components that did not apply.
@@ -1245,6 +1273,12 @@ class PortSimulation:
 
         out["weighted_total"] = round(
             sum(hourly_totals) / len(hourly_totals), 4) if hourly_totals else 0.0
+        # Sum (not mean) of the per-hour scores. Summing is what makes the
+        # banked reward independent of how the agent sliced time: the mean of
+        # an interval depends on the interval, but the total over a set of
+        # hours does not.
+        out["totals_sum"] = sum(hourly_totals)
+        out["scored_hours"] = len(hourly_totals)
         return out
 
     def _sample_components(self) -> Dict[str, float]:
@@ -1411,10 +1445,15 @@ class PortSimulation:
 
         mean_reward = round((1.0 - OUTCOME_WEIGHT) * hourly_score
                             + OUTCOME_WEIGHT * outcome_score, 4)
+        # Banked by the terminal step. The hourly share was banked interval by
+        # interval as the episode ran (compute_step_reward's `progress_credit`),
+        # so the step rewards sum to roughly `total_reward` without overlap.
+        outcome_credit = round(OUTCOME_WEIGHT * outcome_score, 6)
         total_moves = sum(c.total_moves for c in self.cranes.values())
 
         return {
             "total_reward": mean_reward,
+            "outcome_credit": outcome_credit,
             "hourly_score": round(hourly_score, 4),
             "outcome_score": round(outcome_score, 4),
             "service_rate": round(service_rate, 4),

@@ -81,11 +81,22 @@ class SubmitPlanParams(BaseModel, extra="forbid"):
 class PortManager(Environment):
     """Container port terminal management environment.
 
-    Reward convention: only advance_time and submit_plan carry a reward. Every
-    other tool leaves it unset (None) rather than returning 0.0, because the
-    trainer collects non-None step rewards and reduces them (rl.py's
-    reward_reduction) — a stream of explicit zeros is invisible under `sum` but
-    dilutes `mean` about sixfold and pins `min` to 0.0.
+    Reward convention: the step rewards are meant to be SUMMED over an
+    episode, and they partition the episode score. Each advance_time banks the
+    hourly share of the score for the slice of the week it covered; the
+    terminal step banks the outcome share, so nothing is counted twice. The
+    sum approaches compute_final_reward's `total_reward`, falling short by the
+    share of hours that had nothing to score (an empty port banks nothing).
+
+    Two properties this buys: an agent that only reaches hour 80 banks roughly
+    half the hourly share, so progress is rewarded; and the banked total is the
+    same whether it advanced in 1-hour or 12-hour steps, so slicing time finely
+    is not worth anything.
+
+    Every other tool leaves reward unset (None) rather than returning 0.0,
+    since the trainer collects non-None rewards before reducing them — a stream
+    of explicit zeros is invisible under `sum` but dilutes `mean` and pins
+    `min` to 0.0.
     """
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
@@ -388,7 +399,9 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
             return ToolOutput(
                 blocks=[TextBlock(text=text)],
                 metadata=final,
-                reward=final["total_reward"],
+                # The hourly share was banked interval by interval; this banks
+                # the outcome share, so the two do not overlap.
+                reward=final["outcome_credit"],
                 finished=True,
             )
 
@@ -399,7 +412,12 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
         return ToolOutput(
             blocks=[TextBlock(text=text)],
             metadata={"events": events, "step_reward": step_reward, "clock": self.sim.clock},
-            reward=step_reward["weighted_total"],
+            # Credit this interval in proportion to the slice of the week it
+            # covered, so these bank to the time-weighted score times the
+            # fraction of the week reached. Emitting the raw interval score
+            # instead made the accumulated reward track how many times the
+            # agent called advance_time rather than how far it got.
+            reward=step_reward["progress_credit"],
             finished=False,
         )
 
@@ -441,7 +459,9 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
         return ToolOutput(
             blocks=[TextBlock(text=text)],
             metadata=final,
-            reward=final["total_reward"],
+            # As above: the outcome share only, so summing the step rewards
+            # counts nothing twice.
+            reward=final["outcome_credit"],
             finished=True,
         )
 
@@ -555,6 +575,12 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
         if safety is not None:
             lines.append(f"  {SAFETY_COMPONENT:25s}: {safety:.4f} (multiplier)")
         lines.append(f"  {'WEIGHTED TOTAL':25s}: {reward['weighted_total']:.4f}")
+        hours = reward.get("interval_hours")
+        if hours:
+            lines.append(
+                f"  {'banked for these ' + str(hours) + 'h':25s}: "
+                f"{reward['progress_credit']:.4f} "
+                f"({hours}/{PLANNING_HORIZON:.0f} of the week)")
         return "\n".join(lines)
 
     def _format_final_result(self, reward: dict) -> str:

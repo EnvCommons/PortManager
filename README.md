@@ -77,9 +77,23 @@ turnaround. The hourly components are all time-averaged rates and compress
 heavily, so serving one fewer ship out of ten barely moved them; these terms are
 what make service actually delivered visible in the score.
 
-Only `advance_time` and `submit_plan` carry a reward. Other tools leave it unset
-rather than returning 0.0, so a stream of zeros cannot dilute a `mean` or `min`
-reduction over step rewards.
+**Step rewards are meant to be summed.** Only `advance_time` and `submit_plan`
+carry one; other tools leave it unset rather than returning 0.0, so a stream of
+zeros cannot dilute the reduction. Each `advance_time` banks the hourly share
+for the hours it covered, and the terminal step banks the outcome share, so
+nothing is counted twice. Two consequences:
+
+- **Progress is rewarded.** An agent that only reaches hour 80 banks roughly
+  half the hourly share, so getting further through the week is worth more.
+  A run killed before it finishes still keeps what it banked.
+- **Slicing time finely is worth nothing.** Because each interval banks the sum
+  of its hours rather than their average, 168 one-hour advances and 14
+  twelve-hour advances bank the same total for the same play.
+
+The summed total approaches `total_reward` but falls slightly short of it: the
+hourly components average over hours that had something to score, while the
+banked credit divides by the full 168, so hours when the port sat empty bank
+nothing.
 
 ## Tools
 
