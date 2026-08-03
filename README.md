@@ -90,10 +90,7 @@ nothing is counted twice. Two consequences:
   of its hours rather than their average, 168 one-hour advances and 14
   twelve-hour advances bank the same total for the same play.
 
-The summed total approaches `total_reward` but falls slightly short of it: the
-hourly components average over hours that had something to score, while the
-banked credit divides by the full 168, so hours when the port sat empty bank
-nothing.
+Summing every step reward reconstructs the episode score exactly.
 
 ## Tools
 

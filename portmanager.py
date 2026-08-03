@@ -84,9 +84,9 @@ class PortManager(Environment):
     Reward convention: the step rewards are meant to be SUMMED over an
     episode, and they partition the episode score. Each advance_time banks the
     hourly share of the score for the slice of the week it covered; the
-    terminal step banks the outcome share, so nothing is counted twice. The
-    sum approaches compute_final_reward's `total_reward`, falling short by the
-    share of hours that had nothing to score (an empty port banks nothing).
+    terminal step banks its own interval credit plus the outcome share, so the
+    step rewards sum to compute_final_reward's `total_reward` with nothing
+    counted twice.
 
     Two properties this buys: an agent that only reaches hour 80 banks roughly
     half the hourly share, so progress is rewarded; and the banked total is the
@@ -399,9 +399,11 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
             return ToolOutput(
                 blocks=[TextBlock(text=text)],
                 metadata=final,
-                # The hourly share was banked interval by interval; this banks
-                # the outcome share, so the two do not overlap.
-                reward=final["outcome_credit"],
+                # This interval's hourly credit PLUS the outcome share. Banking
+                # only the outcome share here dropped the final interval's
+                # hourly credit, losing more the larger that last advance was.
+                reward=round(step_reward["progress_credit"]
+                             + final["outcome_credit"], 6),
                 finished=True,
             )
 
