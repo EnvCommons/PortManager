@@ -221,8 +221,8 @@ class RailTrack:
     loading_from_blocks: List[str] = field(default_factory=list)
     departed: bool = False
     departure_actual: Optional[float] = None
-    # A track is infrastructure, not a single train: once a train leaves and
-    # the track is turned around, it can carry another.
+    # A track is infrastructure, not a single train: it can carry another once
+    # turned around.
     available_from: float = 0.0
     departures: int = 0
 
@@ -334,10 +334,9 @@ DEFAULT_VESSEL_MIX = {
     VesselType.ULCV: 0.10,
 }
 
-# Reward weights. Weight sits where the agent has controllable, low-noise
-# influence: berth_responsiveness and vessel_turnaround are the two things a
-# terminal is actually judged on, and yard_efficiency is demoted because its
-# 0.50-0.80 target band is a wide plateau with little gradient inside it.
+# Reward weights, concentrated on what the agent controls with least noise.
+# yard_efficiency is low because its 0.50-0.80 target band is a wide plateau
+# with little gradient inside it.
 REWARD_WEIGHTS = {
     "berth_responsiveness": 0.25,
     "crane_productivity": 0.20,
@@ -347,25 +346,16 @@ REWARD_WEIGHTS = {
     "rail_utilization": 0.10,
 }
 
-# Safety is a multiplier on the weighted total, not one more additive slice.
-# As a 0.05 component it was inert (0.99+ every episode, under 1% of the
-# score's variance), so a violation cost almost nothing; as a multiplier it
-# scales the whole hour's reward.
+# A multiplier on the weighted total rather than an additive slice, so a
+# violation costs real reward instead of a fraction of one component.
 SAFETY_COMPONENT = "safety_compliance"
 
-# Charged for each hour overtime is actually being worked, so the decision is a
-# real trade-off: worth paying when it buys back suppressed productivity (a
-# strike), not worth it otherwise.
+# Charged per hour overtime is worked, making it a trade-off: worth paying when
+# it buys back suppressed productivity, not otherwise.
 OVERTIME_HOURLY_COST = 0.05
 
-# The hourly components are all time-averaged rates, which compress: serving one
-# fewer ship out of ten barely moved them. Episode outcomes — ships cleared, and
-# ships cleared inside their target turnaround — carry the dynamic range that
-# distinguishes good operation, so the episode score blends them in.
-#
-# Chosen by sweep (policy_ladder.py): rank correlation between the score and
-# real service delivered rises 0.53 (weight 0) -> 0.73 -> 0.84 -> 0.93 (0.45)
-# -> 0.97 (0.60). Stopped at 0.45 so the dense per-hour shaping stays the
-# majority of the score; raising it further trades credit assignment for
-# fidelity.
+# Share of the episode score coming from outcomes (ships cleared, and cleared
+# within target turnaround) rather than the hourly rates, which are time-averaged
+# and barely move with ships served. At 0.45 the score's rank correlation with
+# service delivered is 0.93, and the dense per-hour shaping stays the majority.
 OUTCOME_WEIGHT = 0.45

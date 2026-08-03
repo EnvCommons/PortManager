@@ -81,22 +81,15 @@ class SubmitPlanParams(BaseModel, extra="forbid"):
 class PortManager(Environment):
     """Container port terminal management environment.
 
-    Reward convention: the step rewards are meant to be SUMMED over an
-    episode, and they partition the episode score. Each advance_time banks the
-    hourly share of the score for the slice of the week it covered; the
-    terminal step banks its own interval credit plus the outcome share, so the
-    step rewards sum to compute_final_reward's `total_reward` with nothing
-    counted twice.
+    Reward convention: step rewards are summed over an episode and partition
+    the episode score. Each advance_time banks the hourly share for the hours it
+    covered, and the terminal step adds the outcome share, so the total is
+    `total_reward`. Progress therefore pays — stopping at hour 80 banks about
+    half the hourly share — and step size does not.
 
-    Two properties this buys: an agent that only reaches hour 80 banks roughly
-    half the hourly share, so progress is rewarded; and the banked total is the
-    same whether it advanced in 1-hour or 12-hour steps, so slicing time finely
-    is not worth anything.
-
-    Every other tool leaves reward unset (None) rather than returning 0.0,
-    since the trainer collects non-None rewards before reducing them — a stream
-    of explicit zeros is invisible under `sum` but dilutes `mean` and pins
-    `min` to 0.0.
+    Other tools leave reward unset (None), not 0.0: the trainer collects
+    non-None rewards before reducing them, and a stream of zeros dilutes `mean`
+    and pins `min` to 0.0.
     """
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
@@ -399,9 +392,7 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
             return ToolOutput(
                 blocks=[TextBlock(text=text)],
                 metadata=final,
-                # This interval's hourly credit PLUS the outcome share. Banking
-                # only the outcome share here dropped the final interval's
-                # hourly credit, losing more the larger that last advance was.
+                # This interval's hourly credit plus the outcome share.
                 reward=round(step_reward["progress_credit"]
                              + final["outcome_credit"], 6),
                 finished=True,
@@ -414,11 +405,8 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
         return ToolOutput(
             blocks=[TextBlock(text=text)],
             metadata={"events": events, "step_reward": step_reward, "clock": self.sim.clock},
-            # Credit this interval in proportion to the slice of the week it
-            # covered, so these bank to the time-weighted score times the
-            # fraction of the week reached. Emitting the raw interval score
-            # instead made the accumulated reward track how many times the
-            # agent called advance_time rather than how far it got.
+            # This interval's share of the week, so the banked total tracks how
+            # far the agent got rather than how often it called this tool.
             reward=step_reward["progress_credit"],
             finished=False,
         )
@@ -450,19 +438,14 @@ A component shows `n/a` for hours where it has nothing to measure (no ship in po
                 blocks=[TextBlock(text="Simulation already ended.")],
                 metadata={"error": "finished"}, finished=True
             )
-        # Compute one more step reward if needed
-        if not self.sim.step_rewards:
-            step = self.sim.compute_step_reward()
-            self.sim.step_rewards.append(step)
-
         final = self.sim.compute_final_reward()
         self.finished = True
         text = self._format_final_result(final)
         return ToolOutput(
             blocks=[TextBlock(text=text)],
             metadata=final,
-            # As above: the outcome share only, so summing the step rewards
-            # counts nothing twice.
+            # The outcome share only: every elapsed hour was already banked by
+            # the advance_time call that covered it.
             reward=final["outcome_credit"],
             finished=True,
         )
