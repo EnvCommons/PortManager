@@ -1944,3 +1944,42 @@ class TestToolRewardConvention:
         assert final.reward is not None and final.finished
         assert run(env.observe_port(ObservePortParams())).reward is None
         assert run(env.advance_time(AdvanceTimeParams(hours=6))).reward is None
+
+
+class TestStepRewardsSumToEpisodeScore:
+    """Summing the step rewards must reconstruct total_reward.
+
+    This regressed once: advance_time's terminal branch banked only the outcome
+    share, silently dropping the final interval's hourly credit — and losing
+    more the larger that last advance was.
+    """
+
+    def _sum_and_total(self, step_hours):
+        pytest.importorskip("openreward")
+        import asyncio
+        from portmanager import PortManager, AdvanceTimeParams
+
+        env = PortManager(dict(CALM_CONFIG))
+        rewards = []
+
+        async def play():
+            while True:
+                out = await env.advance_time(AdvanceTimeParams(hours=step_hours))
+                if out.reward is not None:
+                    rewards.append(out.reward)
+                if out.finished:
+                    return
+        asyncio.run(play())
+        return sum(rewards), env.sim.compute_final_reward()["total_reward"]
+
+    @pytest.mark.parametrize("step_hours", [1, 6, 12])
+    def test_sum_equals_total_reward(self, step_hours):
+        banked, total = self._sum_and_total(step_hours)
+        assert banked == pytest.approx(total, abs=0.001), \
+            f"{step_hours}h steps banked {banked:.4f} but episode scored {total:.4f}"
+
+    def test_banked_total_is_independent_of_step_size(self):
+        """A 12-hour advance must not be worth less than twelve 1-hour ones."""
+        sums = [self._sum_and_total(h)[0] for h in (1, 6, 12)]
+        assert max(sums) - min(sums) == pytest.approx(0.0, abs=0.02), \
+            f"step size changed the banked total: {[round(s, 4) for s in sums]}"

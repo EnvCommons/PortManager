@@ -1230,11 +1230,10 @@ class PortSimulation:
         # terminal step banks the outcome share (compute_final_reward's
         # `outcome_credit`); nothing is counted twice.
         #
-        # The sum approaches `total_reward` but does not equal it exactly:
-        # `hourly_score` averages over hours that HAD something to score, while
-        # this divides by the whole horizon, so hours when the port sat empty
-        # bank nothing. Running a busier port therefore banks more, which is
-        # the intended behaviour.
+        # Summing every step reward reconstructs `total_reward` exactly. Note
+        # this relies on the terminal step banking its own interval credit as
+        # well as the outcome share — banking only the latter silently dropped
+        # the last interval, losing more the larger that final advance was.
         #
         # Two properties this is for: an agent that stops at hour 80 banks
         # roughly half the hourly share, and the banked total does not depend
@@ -1447,7 +1446,7 @@ class PortSimulation:
                             + OUTCOME_WEIGHT * outcome_score, 4)
         # Banked by the terminal step. The hourly share was banked interval by
         # interval as the episode ran (compute_step_reward's `progress_credit`),
-        # so the step rewards sum to roughly `total_reward` without overlap.
+        # so the step rewards sum to `total_reward` without overlap.
         outcome_credit = round(OUTCOME_WEIGHT * outcome_score, 6)
         total_moves = sum(c.total_moves for c in self.cranes.values())
 
