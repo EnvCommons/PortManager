@@ -313,13 +313,9 @@ class PortSimulation:
                 break
             self._process_hourly_operations(h)
             self._last_processed_hour = h
-            # Sample the reward components every simulated hour, so the score
-            # integrates over time instead of snapshotting whenever the agent
-            # happens to stop advancing.
-            #
-            # Hour 0 is the starting instant, before any time has elapsed;
-            # sampling it would give a 168-hour week 169 samples and make
-            # `progress_share` (hours / planning_horizon) fail to sum to 1.
+            # Sample every simulated hour, so the score integrates over time
+            # rather than snapshotting when the agent stops advancing. Hour 0 is
+            # the starting instant and would make a 168-hour week 169 samples.
             self.clock = h
             if h >= 1.0:
                 self.hourly_samples.append(self._sample_components())
@@ -1219,30 +1215,20 @@ class PortSimulation:
         self._samples_consumed = len(self.hourly_samples)
         interval_hours = len(fresh)
         if not fresh:
-            # No simulated hour elapsed since the last call (e.g. two reward
-            # reads back to back) — fall back to an instantaneous sample, and
-            # credit no progress for it.
+            # No hour elapsed since the last call — sample the current instant
+            # so the breakdown is displayable.
             fresh = [self._sample_components()]
         out = self._aggregate_samples(fresh)
 
-        # The step rewards are designed to be SUMMED over the episode. Each
-        # interval banks the hourly share for the hours it covered, and the
-        # terminal step banks the outcome share (compute_final_reward's
-        # `outcome_credit`); nothing is counted twice.
-        #
-        # Summing every step reward reconstructs `total_reward` exactly. Note
-        # this relies on the terminal step banking its own interval credit as
-        # well as the outcome share — banking only the latter silently dropped
-        # the last interval, losing more the larger that final advance was.
-        #
-        # Two properties this is for: an agent that stops at hour 80 banks
-        # roughly half the hourly share, and the banked total does not depend
-        # on whether it advanced in 1-hour or 12-hour steps (verified exact to
-        # rounding when play is held fixed).
+        # Step rewards are summed over the episode: each interval banks the
+        # hourly share for the hours it covered, the terminal step banks the
+        # outcome share, and the total reconstructs `total_reward`.
         out["interval_hours"] = interval_hours
         out["progress_share"] = round(interval_hours / self.planning_horizon, 6)
+        # No elapsed hours, nothing to bank.
         out["progress_credit"] = round(
-            (1.0 - OUTCOME_WEIGHT) * out["totals_sum"] / self.planning_horizon, 6)
+            (1.0 - OUTCOME_WEIGHT) * out["totals_sum"] / self.planning_horizon, 6
+        ) if interval_hours else 0.0
         return out
 
     def _aggregate_samples(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1272,24 +1258,17 @@ class PortSimulation:
 
         out["weighted_total"] = round(
             sum(hourly_totals) / len(hourly_totals), 4) if hourly_totals else 0.0
-        # Sum (not mean) of the per-hour scores. Summing is what makes the
-        # banked reward independent of how the agent sliced time: the mean of
-        # an interval depends on the interval, but the total over a set of
-        # hours does not.
+        # Sum, not mean: a total over a set of hours is independent of how
+        # those hours were sliced into intervals.
         out["totals_sum"] = sum(hourly_totals)
         out["scored_hours"] = len(hourly_totals)
         return out
 
     def _sample_components(self) -> Dict[str, float]:
         """Score every reward component against the current instant."""
-        # 1. Berth responsiveness: are ships left waiting when a berth they
-        # could actually use is standing empty?
-        #
-        # Raw occupancy (occupied/4) was structurally capped around 0.5 by the
-        # arrival schedule and, worse, rewarded holding a ship alongside —
-        # working a vessel faster emptied its berth and lowered the score,
-        # fighting vessel_turnaround. This measures only what the agent
-        # controls: ships it could have berthed and didn't.
+        # 1. Berth responsiveness: ships left waiting while a berth they could
+        # use stands empty. Deliberately not occupancy, which would reward
+        # holding a ship alongside and so fight vessel_turnaround.
         waiting = [v for v in self.vessels.values()
                    if v.status == VesselStatus.WAITING]
         berthed = [v for v in self.vessels.values()
@@ -1313,10 +1292,8 @@ class PortSimulation:
                          if c.status == CraneStatus.WORKING]
         if working_cranes:
             actual_moves = sum(c.actual_moves_this_hour for c in working_cranes)
-            # Benchmark against the work that was actually there to do. Judging
-            # purely on cranes x 30 punished putting a third crane on a ship
-            # with only two cranes' worth of boxes left, even though that
-            # finishes it sooner and frees the berth.
+            # Benchmark against the work available, so crewing a nearly-finished
+            # ship up to its cap is not penalised.
             available_work = sum(v.remaining_moves for v in self.vessels.values()
                                  if v.status == VesselStatus.BERTHED)
             benchmark = min(len(working_cranes) * CRANE_BASELINE_MPH,
@@ -1351,8 +1328,7 @@ class PortSimulation:
                     wait_hours = self.clock - v.actual_arrival
                     score = max(0.0, 1.0 - wait_hours / 24.0)
                     turnaround_scores.append(score)
-        # None, not a magic 0.3: before the first ship arrives there is no
-        # turnaround to judge.
+        # None before the first ship arrives: no turnaround to judge.
         vessel_turn = (sum(turnaround_scores) / len(turnaround_scores)
                        if turnaround_scores else None)
 
@@ -1373,8 +1349,8 @@ class PortSimulation:
             pct_under_60 = sum(1 for t in recent_waits if t <= 60.0) / len(recent_waits)
             truck_turn = pct_under_60
         elif avg_util > 0.80:
-            # Yard is over its target band and nothing is being trucked out —
-            # that is a real failure, not an idle hour.
+            # Over the target band with nothing moving out: a real failure,
+            # not an idle hour.
             truck_turn = 0.0
         else:
             truck_turn = None  # no trucks moved yet, and none needed
@@ -1392,9 +1368,8 @@ class PortSimulation:
         violations = self._count_safety_violations()
         safety = max(0.0, 1.0 - violations * 0.2)
 
-        # Overtime is a labour cost, not a safety breach, and it is charged
-        # only for the hours it is actually being worked. Folding it into
-        # safety made one call at hour 30 bill every remaining hour of the week.
+        # A labour cost rather than a safety breach, charged only for the hours
+        # it is worked.
         overtime_cost = OVERTIME_HOURLY_COST if any(
             d.active and d.agent_action == "overtime"
             for d in self.disruptions.values()) else 0.0
@@ -1435,18 +1410,23 @@ class PortSimulation:
             and (v.departure_time - v.berthing_time) <= v.target_turnaround_hours
         )
 
-        # Service actually delivered. The hourly rates are near-blind to this:
-        # serving 5.4 of 10 ships instead of 6.5 moved them by 0.004, a fifth of
-        # the run-to-run noise, so the score could not tell the two apart.
+        # Service actually delivered. The hourly rates are time-averaged and
+        # compress heavily, so they barely move with ships served.
         service_rate = vessels_completed / total_vessels
         on_time_rate = on_time / total_vessels
         outcome_score = 0.5 * service_rate + 0.5 * on_time_rate
 
-        mean_reward = round((1.0 - OUTCOME_WEIGHT) * hourly_score
+        # hourly_score is a mean over elapsed hours, so scale it by how much of
+        # the week was worked — otherwise ending early would report a score as
+        # though the whole week had been managed.
+        # Elapsed hours, not `basis`, which falls back to one synthetic sample
+        # when the agent never advanced.
+        progress_fraction = min(
+            1.0, len(self.hourly_samples) / self.planning_horizon)
+        mean_reward = round((1.0 - OUTCOME_WEIGHT) * hourly_score * progress_fraction
                             + OUTCOME_WEIGHT * outcome_score, 4)
-        # Banked by the terminal step. The hourly share was banked interval by
-        # interval as the episode ran (compute_step_reward's `progress_credit`),
-        # so the step rewards sum to `total_reward` without overlap.
+        # Banked by the terminal step; the hourly share was banked as the
+        # episode ran.
         outcome_credit = round(OUTCOME_WEIGHT * outcome_score, 6)
         total_moves = sum(c.total_moves for c in self.cranes.values())
 
@@ -1454,6 +1434,7 @@ class PortSimulation:
             "total_reward": mean_reward,
             "outcome_credit": outcome_credit,
             "hourly_score": round(hourly_score, 4),
+            "progress_fraction": round(progress_fraction, 4),
             "outcome_score": round(outcome_score, 4),
             "service_rate": round(service_rate, 4),
             "on_time_rate": round(on_time_rate, 4),

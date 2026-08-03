@@ -80,8 +80,9 @@ what make service actually delivered visible in the score.
 **Step rewards are meant to be summed.** Only `advance_time` and `submit_plan`
 carry one; other tools leave it unset rather than returning 0.0, so a stream of
 zeros cannot dilute the reduction. Each `advance_time` banks the hourly share
-for the hours it covered, and the terminal step banks the outcome share, so
-nothing is counted twice. Two consequences:
+for the hours it covered, and the terminal step banks any unbanked interval plus
+the outcome share, so nothing is counted twice and nothing is dropped. Two
+consequences:
 
 - **Progress is rewarded.** An agent that only reaches hour 80 banks roughly
   half the hourly share, so getting further through the week is worth more.
@@ -90,7 +91,11 @@ nothing is counted twice. Two consequences:
   of its hours rather than their average, 168 one-hour advances and 14
   twelve-hour advances bank the same total for the same play.
 
-Summing every step reward reconstructs the episode score exactly.
+Summing every step reward reconstructs the episode score exactly, whichever way
+the episode ends — running to hour 168, calling `submit_plan` early, or being cut
+off mid-week. The hourly half of the reported score is scaled by the fraction of
+the week actually worked, so an episode that ends at hour 40 is scored on the 40
+hours it ran rather than as though it had managed the full week.
 
 ## Tools
 

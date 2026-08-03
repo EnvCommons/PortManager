@@ -798,8 +798,10 @@ class TestRewardComputation:
         """Final reward = hourly score blended with service actually delivered.
 
         The hourly part is the mean over per-hour samples (not over the agent's
-        advance_time slices), and OUTCOME_WEIGHT of the score comes from ships
-        cleared and ships cleared on time.
+        advance_time slices), scaled by how much of the week was worked, and
+        OUTCOME_WEIGHT of the score comes from ships cleared and ships cleared
+        on time. The scaling is what makes an episode that ends early score
+        below one that ran the whole week.
         """
         sim = PortSimulation(SMALL_CONFIG)
         for _ in range(5):
@@ -808,8 +810,12 @@ class TestRewardComputation:
 
         final = sim.compute_final_reward()
         expected = ((1.0 - OUTCOME_WEIGHT) * final["hourly_score"]
+                    * final["progress_fraction"]
                     + OUTCOME_WEIGHT * final["outcome_score"])
         assert final["total_reward"] == pytest.approx(expected, abs=0.001)
+
+        # 25 of 168 hours worked, so the hourly half is scaled to ~15%.
+        assert final["progress_fraction"] == pytest.approx(25 / 168, abs=0.01)
 
         # The hourly part averages per-hour samples, so it must match a direct
         # aggregation of them rather than the mean of the agent's step rewards.
@@ -1844,16 +1850,13 @@ def _tasks_by_id(ids: List[str]) -> List[Dict[str, Any]]:
 
 class TestRewardDiscrimination:
     """The reward must separate better play from worse play, and must not
-    depend on how the agent slices time. See policy_ladder.py for the full
-    measurement harness."""
+    depend on how the agent slices time."""
 
     def test_reward_independent_of_reward_read_cadence(self):
         """Identical play must score identically however often rewards are read.
 
-        The episode score averages per-hour samples, so calling
-        compute_step_reward more or less often cannot change it. Before that
-        change, reading every 4th advance instead of every advance was worth up
-        to +0.018 for free.
+        The episode score averages per-hour samples, so the read cadence cannot
+        change it.
         """
         task = _tasks_by_id(["port_train_000"])[0]
         scores = [run_fixed_cadence(task, policy_l2, read_every=n)["total_reward"]
@@ -1872,11 +1875,7 @@ class TestRewardDiscrimination:
         assert l1 <= l2, f"naive ({l1:.4f}) should not beat managed ({l2:.4f})"
 
     def test_working_a_ship_faster_is_not_punished(self):
-        """Berth scoring must not reward holding a ship alongside.
-
-        Raw berth occupancy did: finishing a vessel emptied its berth and cut
-        the score, so putting maximum cranes on a ship was worth -0.005.
-        """
+        """Berth scoring must not reward holding a ship alongside."""
         def make(up_to_max):
             def p(sim):
                 _berth_waiting_vessels(sim)
@@ -1901,10 +1900,8 @@ class TestRewardDiscrimination:
 class TestToolRewardConvention:
     """Only the scoring tools may carry a reward.
 
-    The trainer collects non-None step rewards and reduces them
-    (reward_reduction). A stream of explicit 0.0s from non-scoring tools is
-    invisible under `sum` but dilutes `mean` about sixfold and pins `min` to
-    0.0, so non-scoring tools must leave reward unset.
+    A stream of explicit 0.0s from non-scoring tools is invisible under `sum`
+    but dilutes `mean` and pins `min` to 0.0.
     """
 
     def _env(self):
@@ -1947,12 +1944,7 @@ class TestToolRewardConvention:
 
 
 class TestStepRewardsSumToEpisodeScore:
-    """Summing the step rewards must reconstruct total_reward.
-
-    This regressed once: advance_time's terminal branch banked only the outcome
-    share, silently dropping the final interval's hourly credit — and losing
-    more the larger that last advance was.
-    """
+    """Summing the step rewards must reconstruct total_reward."""
 
     def _sum_and_total(self, step_hours):
         pytest.importorskip("openreward")
@@ -1983,3 +1975,54 @@ class TestStepRewardsSumToEpisodeScore:
         sums = [self._sum_and_total(h)[0] for h in (1, 6, 12)]
         assert max(sums) - min(sums) == pytest.approx(0.0, abs=0.02), \
             f"step size changed the banked total: {[round(s, 4) for s in sums]}"
+
+
+class TestEveryExitPathBanksWhatItShows:
+    """Whatever the final breakdown displays must be what was banked.
+
+    Covers the early-exit paths: no rollout has yet called submit_plan, so these
+    are not exercised by trace runs.
+    """
+
+    def _play(self, submit_at=None, advance_first=True, step_hours=6):
+        pytest.importorskip("openreward")
+        import asyncio
+        from portmanager import PortManager, AdvanceTimeParams, SubmitPlanParams
+
+        env = PortManager(dict(CALM_CONFIG))
+        banked = []
+
+        async def go():
+            if advance_first:
+                while env.sim.clock < (submit_at or PLANNING_HORIZON):
+                    out = await env.advance_time(AdvanceTimeParams(hours=step_hours))
+                    if out.reward is not None:
+                        banked.append(out.reward)
+                    if out.finished:
+                        return env.sim.compute_final_reward()
+            out = await env.submit_plan(SubmitPlanParams())
+            if out.reward is not None:
+                banked.append(out.reward)
+            return out.metadata
+        final = asyncio.run(go())
+        return sum(banked), final
+
+    @pytest.mark.parametrize("submit_at", [40, 96, 144])
+    def test_early_submit_banks_what_it_displays(self, submit_at):
+        banked, final = self._play(submit_at=submit_at)
+        assert banked == pytest.approx(final["total_reward"], abs=0.001), \
+            (f"submitting at hour {submit_at} displayed "
+             f"{final['total_reward']:.4f} but banked {banked:.4f}")
+
+    def test_submit_without_advancing_scores_nothing(self):
+        """No hours worked means no hourly credit — displayed or banked."""
+        banked, final = self._play(advance_first=False)
+        assert banked == pytest.approx(0.0, abs=1e-9)
+        assert final["total_reward"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_early_submit_scores_below_a_full_week(self):
+        """Progress must be worth something: stopping early scores less."""
+        early, _ = self._play(submit_at=48)
+        full, _ = self._play()
+        assert early < full, \
+            f"stopping at hour 48 banked {early:.4f}, full week banked {full:.4f}"
