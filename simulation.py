@@ -1151,16 +1151,19 @@ class PortSimulation:
 
         disruption_info = []
         for d in self.disruptions.values():
-            disruption_info.append({
+            di = {
                 "disruption_id": d.disruption_id,
                 "type": d.disruption_type.value,
                 "start_hour": d.start_hour,
-                "end_hour": d.end_hour,
                 "severity": d.severity,
                 "active": d.active,
                 "resolved": d.resolved,
                 "agent_action": d.agent_action,
-            })
+            }
+            # How long a disruption lasts is only announced once it starts.
+            if d.active or d.resolved:
+                di["end_hour"] = d.end_hour
+            disruption_info.append(di)
 
         # Upcoming events
         upcoming_vessels = [
