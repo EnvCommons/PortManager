@@ -727,6 +727,36 @@ class TestDisruptionHandling:
             assert "error" in result
 
 
+    def test_status_hides_end_of_future_disruption(self):
+        """A disruption's end hour appears only once it has started."""
+        sim = PortSimulation(STORM_CONFIG)
+        (storm,) = sim.get_port_status()["disruptions"]
+        assert not storm["active"] and not storm["resolved"]
+        assert storm["start_hour"] == 5.0
+        assert "end_hour" not in storm
+
+        sim.advance_to(7.0)
+        (storm,) = sim.get_port_status()["disruptions"]
+        assert storm["active"]
+        assert storm["end_hour"] == 10.0
+
+        sim.advance_to(12.0)
+        (storm,) = sim.get_port_status()["disruptions"]
+        assert storm["resolved"]
+        assert storm["end_hour"] == 10.0
+
+    def test_observe_port_metadata_hides_end_of_future_disruption(self):
+        pytest.importorskip("openreward")
+        import asyncio
+        import json
+        from portmanager import PortManager, ObservePortParams
+        env = PortManager(dict(CALM_CONFIG))
+        out = asyncio.run(env.observe_port(ObservePortParams()))
+        (d,) = out.metadata["disruptions"]
+        assert not d["active"] and "end_hour" not in d
+        assert "76.0" not in json.dumps(out.metadata["disruptions"])
+
+
 # ===========================================================================
 # G. REWARD COMPUTATION TESTS
 # ===========================================================================
