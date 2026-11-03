@@ -1,6 +1,6 @@
 # PortManager
 
-[![⭐ OpenReward Environment](https://img.shields.io/badge/%E2%AD%90%20OpenReward-Environment-f7e6cc)](https://openreward.ai/GeneralReasoning/portmanager)
+[![⭐ OpenReward Environment](https://img.shields.io/badge/%E2%AD%90%20OpenReward-Environment-f7e6cc)](https://openreward.ai/GeneralReasoning/PortManager)
 
 ## Description
 
@@ -23,11 +23,11 @@ No sandbox or special compute required. PortManager is a pure discrete-event sim
 
 ## License
 
-[ORLv1](https://openreward.ai/orlv1.md).
+[MIT](https://opensource.org/licenses/MIT).
 
 ## Tasks
 
-There are 30 training tasks across 6 scenario types:
+There are 30 tasks in the `train` split and 10 in `test`. The training tasks span 6 scenario types:
 
 - **Calm Week** (5 tasks): Normal operations with minor disruptions
 - **Storm Season** (5 tasks): Two major storms causing crane shutdowns
@@ -36,23 +36,20 @@ There are 30 training tasks across 6 scenario types:
 - **Equipment Aging** (5 tasks): Frequent crane breakdowns
 - **Mixed Cargo** (5 tasks): High proportion of reefer and hazmat cargo
 
-And 10 test tasks across 4 scenario types:
+The test tasks span 4 scenario types:
 
 - **Perfect Storm** (3 tasks): Storm + labor dispute + vessel delays + equipment failure
 - **Mega Vessel Week** (3 tasks): Multiple ULCV arrivals competing for deep-draft berths
 - **Customs Crackdown** (2 tasks): Elevated 15% inspection rate blocking yard space
 - **Cascade Crisis** (2 tasks): Multiple delayed vessels causing yard overflow
 
-Each task simulates a 168-hour (1-week) planning horizon with 6-14 vessel arrivals.
+Each task simulates a 168-hour (1-week) planning horizon with 8-14 vessel arrivals.
 
 ## Reward Structure
 
-This is a dense, verifiable reward environment. No LLM graders are used. Each
-`advance_time` call returns a score for the hours it advanced through, and the
-episode score combines two parts:
+This is a dense, verifiable reward environment. No LLM graders are used. Each `advance_time` call returns a score for the hours it advanced through, and the episode score combines two parts:
 
-**Hourly components (55%).** Sampled once per *simulated hour* — not once per
-`advance_time` call — so the score does not depend on how the agent slices time:
+**Hourly components (55%).** Sampled once per *simulated hour* (not once per `advance_time` call), so the score does not depend on how the agent slices time:
 
 | component | weight | measures |
 |---|---|---|
@@ -63,39 +60,22 @@ episode score combines two parts:
 | truck_turnaround | 0.10 | share of trucks served within 60 minutes |
 | rail_utilization | 0.10 | fill rate of departed trains |
 
-A component reads `n/a` for hours where it has nothing to measure (no ship in
-port, no trucks moving); those hours are scored on the remaining components with
-weights renormalised, so idle time is neither rewarded nor punished.
-`safety_compliance` multiplies the hour's score rather than adding to it, and
-overtime is charged for each hour it is worked.
+A component reads `n/a` for hours where it has nothing to measure (no ship in port, no trucks moving); those hours are scored on the remaining components with weights renormalised, so idle time is neither rewarded nor punished. `safety_compliance` multiplies the hour's score rather than adding to it, and overtime is charged for each hour it is worked.
 
-Note that berth *responsiveness* is deliberately not berth *occupancy*: rewarding
-occupancy penalised working a ship faster, because finishing it emptied the berth.
+Note that berth *responsiveness* is deliberately not berth *occupancy*: rewarding occupancy penalised working a ship faster, because finishing it emptied the berth.
 
-**Episode outcomes (45%).** Ships cleared, and ships cleared inside their target
-turnaround. The hourly components are all time-averaged rates and compress
-heavily, so serving one fewer ship out of ten barely moved them; these terms are
-what make service actually delivered visible in the score.
+**Episode outcomes (45%).** Ships cleared, and ships cleared inside their target turnaround. The hourly components are all time-averaged rates and compress heavily, so serving one fewer ship out of ten barely moved them; these terms are what make service actually delivered visible in the score.
 
-**Step rewards are meant to be summed.** Only `advance_time` and `submit_plan`
-carry one; other tools leave it unset rather than returning 0.0, so a stream of
-zeros cannot dilute the reduction. Each `advance_time` banks the hourly share
-for the hours it covered, and the terminal step banks any unbanked interval plus
-the outcome share, so nothing is counted twice and nothing is dropped. Two
-consequences:
+**Step rewards are meant to be summed.** Only `advance_time` and `submit_plan` carry one; other tools leave it unset rather than returning 0.0, so a stream of zeros cannot dilute the reduction. Each `advance_time` banks the hourly share for the hours it covered, and the terminal step banks any unbanked interval plus the outcome share, so nothing is counted twice and nothing is dropped. Two consequences:
 
-- **Progress is rewarded.** An agent that only reaches hour 80 banks roughly
-  half the hourly share, so getting further through the week is worth more.
-  A run killed before it finishes still keeps what it banked.
-- **Slicing time finely is worth nothing.** Because each interval banks the sum
-  of its hours rather than their average, 168 one-hour advances and 14
-  twelve-hour advances bank the same total for the same play.
+- **Progress is rewarded.** An agent that only reaches hour 80 banks roughly half the hourly share, so getting further through the week is worth more. A run killed before it finishes still keeps what it banked.
+- **Slicing time finely is worth nothing.** Because each interval banks the sum of its hours rather than their average, 168 one-hour advances and 14 twelve-hour advances bank the same total for the same play.
 
-Summing every step reward reconstructs the episode score exactly, whichever way
-the episode ends — running to hour 168, calling `submit_plan` early, or being cut
-off mid-week. The hourly half of the reported score is scaled by the fraction of
-the week actually worked, so an episode that ends at hour 40 is scored on the 40
-hours it ran rather than as though it had managed the full week.
+Summing every step reward reconstructs the episode score exactly, whichever way the episode ends: running to hour 168, calling `submit_plan` early, or being cut off mid-week. The hourly half of the reported score is scaled by the fraction of the week actually worked, so an episode that ends at hour 40 is scored on the 40 hours it ran rather than as though it had managed the full week.
+
+## Data
+
+There are no data files. Scenarios are generated in code (`scenarios.py`) from fixed seeds, with the vessel count, vessel mix, disruptions and cargo composition set per scenario type.
 
 ## Tools
 
@@ -114,11 +94,11 @@ Agents have access to 10 tools:
 
 ## Time Horizon
 
-PortManager is an open-ended, long-horizon environment simulating a full week of port operations. A typical episode involves 40-60 advance_time calls plus observation and action calls.
+PortManager is an open-ended, long-horizon environment simulating a full week of port operations. `advance_time` moves the clock 1-12 hours per call, so reaching hour 168 takes at least 14 calls, plus observation and action calls.
 
 ## Other Environment Requirements
 
-There are no further environment requirements; PortManager works out of the box with the OpenReward endpoint without any secrets.
+PortManager needs no secrets.
 
 ## Safety
 
@@ -134,6 +114,6 @@ The environment includes safety compliance as a reward component, teaching agent
   title     = {PortManager},
   year      = {2026},
   publisher = {OpenReward},
-  url       = {https://openreward.ai/GeneralReasoning/portmanager}
+  url       = {https://openreward.ai/GeneralReasoning/PortManager}
 }
 ```
